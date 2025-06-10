@@ -522,6 +522,9 @@ class MimicEnv(AIRECEnv):
         log["mimic_action_smoothness_penalty"] = action_smooth_pen
         log["mimic_total_reward"] = total_reward
         log["current_animation_frame"] = self.current_animation_step.float()
+        
+        #WanDB
+        self.extras["counters"] = {}
 
         return total_reward
 
