@@ -15,7 +15,7 @@ from isaaclab_rl.wrappers.frame_stack import FrameStack
 from isaaclab_rl.wrappers.isaaclab_wrapper import IsaacLabWrapper
 
 # ADD YOUR ENVS HERE
-from tasks import franka  # noqa: F401
+from tasks import franka, mimic  # noqa: F401
 
 # change this to something else if you want
 LOG_PATH = os.getcwd()

@@ -62,7 +62,7 @@ experiment:
   tb_log: True
   wandb: 1
   wandb_kwargs: {
-    "entity": "my-phd",
+    "entity": "simon-gormuzov-waseda-university",
     "project": "isaac_lab",
     "group": "franka_lift",
     "name": "test",
