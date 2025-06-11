@@ -109,6 +109,7 @@ class MimicEnvCfg(AIRECEnvCfg):
 
     # -- Ghost Visualizer Configuration
     enable_ghost_visualizer: bool = True
+    num_eval_envs: int = 8  # Number of envs at the START of the batch to use for evaluation (will show ghost).
     ghost_robot_cfg: ArticulationCfg = DEFAULT_KINEMATIC_GHOST_CFG.replace(
         spawn=DEFAULT_KINEMATIC_GHOST_CFG.spawn.replace(
             # Set kinematic properties for the ghost to save performance.
@@ -125,12 +126,6 @@ class MimicEnvCfg(AIRECEnvCfg):
                 stabilization_threshold=0.0,
             ),
             activate_contact_sensors=False,
-            # To set the ghost's opacity and color, uncomment the following lines.
-            # This requires importing PreviewSurfaceCfg from the correct module.
-            # visual_material=PreviewSurfaceCfg(
-            #     opacity=0.4,
-            #     diffuse_color=(0.3, 0.3, 0.8)
-            # )
         )
     )
 
@@ -143,11 +138,6 @@ class MimicEnvCfg(AIRECEnvCfg):
 class MimicEnv(AIRECEnv):
     """
     An environment for training a robot to mimic a pre-recorded animation.
-
-    This environment rewards an RL agent for tracking the joint positions from a CSV animation
-    file. It includes a "ghost" robot visualization to show the target pose at each frame.
-    The core logic for advancing the animation and updating states is handled in the
-    overridden `_compute_intermediate_values` method in the parent `AIRECEnv`.
     """
 
     cfg: MimicEnvCfg
@@ -156,34 +146,40 @@ class MimicEnv(AIRECEnv):
 
     def __init__(self, cfg: MimicEnvCfg, render_mode: str | None = None, **kwargs):
         """Initializes the mimicry environment."""
-        #print("DEBUG: MimicEnv.__init__ - START")
         self.cfg = cfg
         self.ghost_robot = None
         self.ghost_mimic_joint_indices = None
 
-        # -- Pre-initialization checks and setup
+        # -- FIX: Initialize attributes used in _setup_scene BEFORE calling the parent constructor.
+        # The parent constructor calls `_setup_scene`, which depends on these attributes.
+        # We initialize them on the CPU first and move them to the correct device after super().__init__().
+        self.eval_env_ids = torch.tensor([], dtype=torch.long)
+        self.is_eval_env_mask = torch.zeros(cfg.scene.num_envs, dtype=torch.bool)
+        if self.cfg.enable_ghost_visualizer and self.cfg.num_eval_envs > 0:
+            num_envs = cfg.scene.num_envs
+            if self.cfg.num_eval_envs > num_envs:
+                print(f"[WARNING] num_eval_envs ({self.cfg.num_eval_envs}) > num_envs ({num_envs}). Clamping.")
+                self.cfg.num_eval_envs = num_envs
+            self.eval_env_ids = torch.arange(0, self.cfg.num_eval_envs, dtype=torch.long)
+            if self.eval_env_ids.numel() > 0:
+                self.is_eval_env_mask[self.eval_env_ids] = True
+                print(f"[INFO] MimicEnv: Initialized eval envs (on CPU): {self.eval_env_ids.tolist()}")
+
+        # -- Pre-initialization checks and dynamic config adjustments
         provisional_physics_dt = cfg.sim.dt
         provisional_decimation = cfg.decimation
         provisional_control_dt = provisional_physics_dt * provisional_decimation
 
-        # Check if control frequency matches animation frequency
         if not math.isclose(provisional_control_dt, cfg.animation_dt_info, rel_tol=1e-5):
             print(
                 f"[MimicEnv __init__] CONFIG WARNING: Provisional control_dt ({provisional_control_dt:.6f}s) "
-                f"from cfg (sim.dt={cfg.sim.dt}, decimation={cfg.decimation}) "
-                f"does NOT match cfg.animation_dt_info ({cfg.animation_dt_info:.6f}s). "
-                f"The environment will proceed with control_dt={provisional_control_dt:.6f}s."
+                f"does NOT match cfg.animation_dt_info ({cfg.animation_dt_info:.6f}s)."
             )
 
-        # Load animation data statically to determine the required episode length
         self.max_animation_steps = 0
         self._load_animation_data_static(cfg.animation_file, cfg.csv_column_joint_names)
         self._mimic_env_determined_max_animation_steps = self.max_animation_steps
-        #print(
-        #    f"DEBUG: MimicEnv.__init__ (after static load) - _mimic_env_determined_max_animation_steps: {self._mimic_env_determined_max_animation_steps}"
-        #)
 
-        # Dynamically adjust episode length to ensure the full animation can be played
         required_episode_length_s = cfg.episode_length_s
         if self._mimic_env_determined_max_animation_steps > 0 and provisional_control_dt > 0:
             calculated_animation_duration_s = self._mimic_env_determined_max_animation_steps * provisional_control_dt
@@ -191,19 +187,17 @@ class MimicEnv(AIRECEnv):
             if required_episode_length_s_for_anim > required_episode_length_s:
                 print(f"[MimicEnv __init__ PRE-SUPER] INFO: Original cfg.episode_length_s: {cfg.episode_length_s:.2f}s.")
                 print(
-                    f"[MimicEnv __init__ PRE-SUPER] INFO: Animation requires {self._mimic_env_determined_max_animation_steps} control steps ({calculated_animation_duration_s:.2f}s). "
-                    f"With buffer, desired episode length is {required_episode_length_s_for_anim:.2f}s."
+                    f"[MimicEnv __init__ PRE-SUPER] INFO: Animation requires {self._mimic_env_determined_max_animation_steps} steps. "
+                    f"Desired episode length is {required_episode_length_s_for_anim:.2f}s."
                 )
                 required_episode_length_s = required_episode_length_s_for_anim
 
-        # -- Prepare configuration for the parent AIRECEnv
         modified_parent_cfg = copy.deepcopy(cfg)
         modified_parent_cfg.episode_length_s = required_episode_length_s
         self.num_mimic_joints = len(cfg.csv_column_joint_names)
         if self.num_mimic_joints == 0:
             raise ValueError("'MimicEnvCfg.csv_column_joint_names' cannot be empty.")
 
-        # Map joint names from the CSV file to the robot's actual joint names
         self.robot_mimicked_joint_names_ordered = []
         self.csv_to_robot_joint_map = {
             "H1": "head_joint_1", "H2": "head_joint_2", "H3": "head_joint_3",
@@ -219,7 +213,6 @@ class MimicEnv(AIRECEnv):
                 raise ValueError(f"CSV column '{csv_name}' not found in csv_to_robot_joint_map.")
             self.robot_mimicked_joint_names_ordered.append(robot_name)
 
-        # Override parent config with mimic-specific dimensions and settings
         modified_parent_cfg.actuated_joint_names = self.robot_mimicked_joint_names_ordered
         modified_parent_cfg.num_actions = self.num_mimic_joints
         modified_parent_cfg.num_gt_observations = self.num_mimic_joints * 3
@@ -227,122 +220,58 @@ class MimicEnv(AIRECEnv):
             cfg_num_prop_joints = cfg.num_prop_joints
             modified_parent_cfg.num_prop_observations = cfg_num_prop_joints * 2 + 7 * 2 + self.num_mimic_joints
 
-        # Initialize the parent environment
-        #print("DEBUG: MimicEnv.__init__ - Calling super().__init__()")
+        # Call the parent constructor, which will trigger _setup_scene
         super().__init__(cfg=modified_parent_cfg, render_mode=render_mode, **kwargs)
-        #print("DEBUG: MimicEnv.__init__ - Returned from super().__init__()")
 
-        # -- Post-initialization setup
+        # -- Post-super initializations
+        # Now that the parent is initialized, self.device is available.
+        self.eval_env_ids = self.eval_env_ids.to(self.device)
+        self.is_eval_env_mask = self.is_eval_env_mask.to(self.device)
+
         _physics_dt_final = self.sim.get_physics_dt()
         self.control_dt = _physics_dt_final * self.cfg.decimation
         if self.control_dt <= 0:
-            raise ValueError(
-                f"[MimicEnv __init__ POST-SUPER] CRITICAL: Final control_dt ({self.control_dt}) must be positive."
-            )
+            raise ValueError("[MimicEnv __init__ POST-SUPER] CRITICAL: Final control_dt must be positive.")
 
         if hasattr(self.cfg, "animation_dt_info") and not math.isclose(
             self.control_dt, self.cfg.animation_dt_info, rel_tol=1e-5
         ):
-            print(
-                f"[MimicEnv __init__] POST-SUPER WARNING: Final control_dt ({self.control_dt:.6f}s) "
-                f"does NOT match cfg.animation_dt_info ({self.cfg.animation_dt_info:.6f}s). "
-            )
+            print("[MimicEnv __init__] POST-SUPER WARNING: Final control_dt does NOT match cfg.animation_dt_info.")
         else:
-            print(
-                f"[MimicEnv __init__] POST-SUPER INFO: Final control_dt ({self.control_dt:.6f}s) matches animation_dt_info."
-            )
+            print("[MimicEnv __init__] POST-SUPER INFO: Final control_dt matches animation_dt_info.")
 
-        # Load animation data into a tensor for runtime access
         self._load_animation_data()
-        print(
-            f"DEBUG: MimicEnv.__init__ (after full load) - self.max_animation_steps: {self.max_animation_steps}, self.animation_pos_data exists: {hasattr(self, 'animation_pos_data')}"
-        )
 
-        # Final check on episode length vs animation length
         if hasattr(self, "max_animation_steps") and self.max_animation_steps > 0 and self.control_dt > 0:
-            required_total_control_steps_for_animation = self.max_animation_steps
-            if self.max_episode_length < required_total_control_steps_for_animation:
+            if self.max_episode_length < self.max_animation_steps:
                 print(
                     f"[MimicEnv __init__] POST-SUPER CRITICAL WARNING: Final max_episode_length ({self.max_episode_length}) "
-                    f"is STILL SHORTER than animation steps ({required_total_control_steps_for_animation})."
+                    f"is STILL SHORTER than animation steps ({self.max_animation_steps})."
                 )
 
-        # Create joint index mappings for the main controllable robot
         try:
             self.mimic_joint_indices_in_robot = torch.tensor(
                 [self.robot.joint_names.index(name) for name in self.robot_mimicked_joint_names_ordered],
                 device=self.device,
                 dtype=torch.long,
             )
-        except ValueError as e:
-            print(f"ERROR: A mapped robot joint name was not found in MAIN robot's `joint_names` list: {e}")
-            raise
-        except AttributeError:
-            print(
-                "ERROR: self.robot or self.robot.joint_names not available for mimic_joint_indices_in_robot. This might happen if parent __init__ failed."
-            )
+        except (ValueError, AttributeError) as e:
+            print(f"ERROR creating mimic_joint_indices_in_robot: {e}")
             raise
 
-        # Create joint index mappings for the ghost robot after it has been spawned in _setup_scene
-        if self.cfg.enable_ghost_visualizer and self.ghost_robot is not None:
-            if hasattr(self.ghost_robot, "joint_names"):
-                try:
-                    self.ghost_mimic_joint_indices = torch.tensor(
-                        [self.ghost_robot.joint_names.index(name) for name in self.robot_mimicked_joint_names_ordered],
-                        device=self.device,
-                        dtype=torch.long,
-                    )
-                    print("INFO: MimicEnv.__init__ - Successfully created ghost_mimic_joint_indices.")
-                except ValueError as e:
-                    print(
-                        f"[ERROR] MimicEnv.__init__: A mimicked joint name was not found in GHOST_ROBOT's `joint_names` list: {e}"
-                    )
-                    print(f"    GHOST_ROBOT available joints (first 25): {self.ghost_robot.joint_names[:25]}")
-                    print(f"    Trying to map these names: {self.robot_mimicked_joint_names_ordered}")
-                    self.ghost_mimic_joint_indices = None
-                except AttributeError as e:
-                    print(
-                        f"[ERROR] MimicEnv.__init__: self.ghost_robot or its attributes not fully available for ghost_mimic_joint_indices: {e}"
-                    )
-                    self.ghost_mimic_joint_indices = None
-            else:
-                print(
-                    "[WARNING] MimicEnv.__init__: self.ghost_robot does not have 'joint_names' attribute. Cannot create ghost_mimic_joint_indices."
-                )
-                self.ghost_mimic_joint_indices = None
-        elif self.cfg.enable_ghost_visualizer:
-            print(
-                "[WARNING] MimicEnv.__init__: Ghost visualizer enabled in Cfg but self.ghost_robot is None after super init. Cannot create ghost_mimic_joint_indices."
-            )
-            self.ghost_mimic_joint_indices = None
-
-        # Setup velocity limits for mimicked joints
         if self.robot.data.joint_vel_limits is None or self.robot.data.joint_vel_limits.numel() == 0:
-            print(
-                "[MimicEnv __init__] WARNING: robot.data.joint_vel_limits not populated. Using default large limits (+/-10 rad/s)."
-            )
-            self.mimic_joint_vel_limits_lower = torch.full(
-                (self.num_mimic_joints,), -10.0, device=self.device, dtype=torch.float32
-            )
-            self.mimic_joint_vel_limits_upper = torch.full(
-                (self.num_mimic_joints,), 10.0, device=self.device, dtype=torch.float32
-            )
+            self.mimic_joint_vel_limits_lower = torch.full((self.num_mimic_joints,), -10.0, device=self.device, dtype=torch.float32)
+            self.mimic_joint_vel_limits_upper = torch.full((self.num_mimic_joints,), 10.0, device=self.device, dtype=torch.float32)
         else:
             raw_mimic_joint_vel_limits = self.robot.data.joint_vel_limits[self.mimic_joint_indices_in_robot, :].clone()
             self.mimic_joint_vel_limits_lower = raw_mimic_joint_vel_limits[:, 0] * 0.8
             self.mimic_joint_vel_limits_upper = raw_mimic_joint_vel_limits[:, 1] * 0.8
-        problematic_limits_mask = torch.isclose(
-            self.mimic_joint_vel_limits_lower, torch.tensor(0.0, device=self.device)
-        ) & torch.isclose(self.mimic_joint_vel_limits_upper, torch.tensor(0.0, device=self.device))
+        
+        problematic_limits_mask = torch.isclose(self.mimic_joint_vel_limits_lower, torch.tensor(0.0, device=self.device)) & torch.isclose(self.mimic_joint_vel_limits_upper, torch.tensor(0.0, device=self.device))
         if torch.any(problematic_limits_mask):
-            num_problematic = torch.sum(problematic_limits_mask).item()
-            print(
-                f"[MimicEnv __init__] WARNING: {num_problematic} mimicked joints have zero scaled velocity limits. Overriding to +/- 0.1 rad/s."
-            )
             self.mimic_joint_vel_limits_lower[problematic_limits_mask] = -0.1
             self.mimic_joint_vel_limits_upper[problematic_limits_mask] = 0.1
 
-        # -- Initialize runtime variables for the mimicry task
         self.current_animation_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.previous_actions = torch.zeros((self.num_envs, self.cfg.num_actions), device=self.device)
         self.global_env_steps_counter = 0
@@ -354,145 +283,101 @@ class MimicEnv(AIRECEnv):
             "mimic_total_reward": torch.zeros(self.num_envs, device=self.device),
             "current_animation_frame": torch.zeros(self.num_envs, device=self.device, dtype=torch.float32),
         }
+
         if hasattr(self, "animation_pos_data") and self.max_animation_steps <= 0:
-            print("[MimicEnv __init__] WARNING: Animation data appears empty after full loading. Mimicry may not function.")
-        print("DEBUG: MimicEnv.__init__ - END")
+            print("[MimicEnv __init__] WARNING: Animation data appears empty.")
 
     def _setup_scene(self):
         """Sets up the simulation scene, including the ghost robot."""
-        print("DEBUG: MimicEnv._setup_scene - START")
-        # Call parent setup to spawn the main robot and other base assets
         super()._setup_scene()
-        print("DEBUG: MimicEnv._setup_scene - After super()._setup_scene()")
 
-        # Spawn the ghost robot if enabled in the configuration
         if self.cfg.enable_ghost_visualizer:
             self.ghost_robot = Articulation(self.cfg.ghost_robot_cfg)
             self.scene.articulations["ghost_robot"] = self.ghost_robot
             print("[INFO] Ghost visualizer robot added to the scene.")
-        print("DEBUG: MimicEnv._setup_scene - END")
+
+            # Find the corresponding joint indices on the ghost robot
+            if hasattr(self.ghost_robot, "joint_names"):
+                try:
+                    self.ghost_mimic_joint_indices = torch.tensor(
+                        [self.ghost_robot.joint_names.index(name) for name in self.robot_mimicked_joint_names_ordered],
+                        device=self.device,
+                        dtype=torch.long,
+                    )
+                except (ValueError, AttributeError) as e:
+                    print(f"ERROR creating ghost_mimic_joint_indices: {e}")
+                    self.ghost_mimic_joint_indices = None
+            
+            # Hide ghost in non-evaluation (training) environments to improve performance
+            if self.eval_env_ids.numel() < self.num_envs:
+                # Get IDs of training envs by inverting the evaluation env mask
+                train_env_ids = torch.where(~self.is_eval_env_mask)[0]
+
+                if train_env_ids.numel() > 0:
+                    self.ghost_robot.set_visibility(False, env_ids=train_env_ids)
+                    print(f"[INFO] Made ghost robot invisible for {train_env_ids.numel()} training environments.")
 
     def _load_animation_data_static(self, animation_file_path: str, csv_columns: list[str]):
-        """Loads animation data from a CSV file just to determine its length for pre-init calculations."""
-        print(f"DEBUG: _load_animation_data_static - Loading: {animation_file_path}")
+        """Loads animation data from a CSV file just to determine its length."""
         try:
             df = pd.read_csv(animation_file_path)
             missing_cols = [name for name in csv_columns if name not in df.columns]
             if missing_cols:
-                raise KeyError(
-                    f"Joints {missing_cols} missing from CSV '{animation_file_path}'. Available columns: {df.columns.tolist()}."
-                )
-            animation_relevant_df = df[csv_columns]
-            animation_np = animation_relevant_df.values
-            self.max_animation_steps = animation_np.shape[0]
-            print(f"DEBUG: _load_animation_data_static - Loaded {self.max_animation_steps} frames for setup.")
+                raise KeyError(f"Joints {missing_cols} missing from CSV '{animation_file_path}'.")
+            self.max_animation_steps = len(df)
             if self.max_animation_steps == 0:
-                print(f"[MimicEnv _load_animation_data_static] CRITICAL: CSV '{animation_file_path}' loaded 0 frames.")
-        except FileNotFoundError:
-            print(f"ERROR: Animation file not found at '{animation_file_path}'.")
-            self.max_animation_steps = 0
-        except Exception as e:
+                print(f"[MimicEnv] CRITICAL: CSV '{animation_file_path}' loaded 0 frames.")
+        except (FileNotFoundError, KeyError) as e:
             print(f"ERROR loading animation data statically from '{animation_file_path}': {e}")
             self.max_animation_steps = 0
-        if self.max_animation_steps == 0:
-            print("[MimicEnv _load_animation_data_static] CRITICAL: Failed to load animation for length check.")
 
     def _load_animation_data(self):
         """Loads the full animation data from a CSV file into a runtime tensor."""
-        print(f"DEBUG: _load_animation_data - Loading: {self.cfg.animation_file}")
         try:
             df = pd.read_csv(self.cfg.animation_file)
-            missing_cols = [name for name in self.cfg.csv_column_joint_names if name not in df.columns]
-            if missing_cols:
-                print(
-                    f"DEBUG: _load_animation_data - Missing CSV columns: {missing_cols}. Available columns in CSV: {df.columns.tolist()}"
-                )
-                raise KeyError(f"Joints {missing_cols} missing from CSV. Available: {df.columns.tolist()}.")
             animation_relevant_df = df[self.cfg.csv_column_joint_names]
             animation_np = animation_relevant_df.values
             self.animation_pos_data = torch.tensor(animation_np, dtype=torch.float32, device=self.device)
             self.max_animation_steps = self.animation_pos_data.shape[0]
 
-            print(
-                f"DEBUG: _load_animation_data - self.animation_pos_data.shape: {self.animation_pos_data.shape}, self.max_animation_steps set to: {self.max_animation_steps}"
-            )
-            if self.max_animation_steps > 5:
-                print(
-                    f"DEBUG: _load_animation_data - First 3 rows of self.animation_pos_data[:, 0:5] (first 5 joints):\n{self.animation_pos_data[:3, :5]}"
-                )
-
             if self.max_animation_steps == 0:
-                print("[MimicEnv _load_animation_data] CRITICAL: CSV loaded 0 frames.")
-            elif torch.all(torch.isclose(self.animation_pos_data, torch.zeros_like(self.animation_pos_data))):
-                print("[MimicEnv _load_animation_data] WARNING: Loaded animation data is all zeros. Check CSV (units should be radians).")
+                print("[MimicEnv] CRITICAL: CSV loaded 0 frames for playback.")
             else:
-                print(f"[MimicEnv _load_animation_data] Successfully loaded {self.max_animation_steps} frames for playback.")
-        except FileNotFoundError:
-            print(f"ERROR: Animation file not found: '{self.cfg.animation_file}'.")
-            self.animation_pos_data = torch.empty((0, self.num_mimic_joints), device=self.device, dtype=torch.float32)
-            self.max_animation_steps = 0
-        except Exception as e:
+                print(f"[MimicEnv] Successfully loaded {self.max_animation_steps} frames for playback.")
+        except (FileNotFoundError, KeyError) as e:
             print(f"ERROR loading animation data from '{self.cfg.animation_file}': {e}")
             self.animation_pos_data = torch.empty((0, self.num_mimic_joints), device=self.device, dtype=torch.float32)
             self.max_animation_steps = 0
-        if self.max_animation_steps == 0:
-            print("[MimicEnv _load_animation_data] CRITICAL: Failed to load animation for playback.")
 
     def _reset_idx(self, env_ids: torch.Tensor):
         """Resets the state for specified environments."""
-        if self.num_envs > 0 and env_ids.numel() > 0:
-            print(
-                f"DEBUG: MimicEnv._reset_idx - START - env_ids: {env_ids.tolist()}, current_animation_step BEFORE any action: {self.current_animation_step[env_ids].tolist()}"
-            )
-        # Reset animation-specific states first
         if env_ids.numel() > 0:
             self.current_animation_step[env_ids] = 0
-            self.previous_actions[env_ids] = 0.0
-            print(f"DEBUG: MimicEnv._reset_idx - Set current_animation_step[{env_ids.tolist()}] to 0.")
-
-        # Call parent reset logic
+            self.previous_actions[env_ids].zero_()
         super()._reset_idx(env_ids)
-
-        if self.num_envs > 0 and env_ids.numel() > 0:
-            print(
-                f"DEBUG: MimicEnv._reset_idx - END - env_ids: {env_ids.tolist()}, current_animation_step AFTER super()._reset_idx(): {self.current_animation_step[env_ids].tolist()}"
-            )
 
     def _apply_action(self) -> None:
         """Processes and applies the actions from the RL agent to the robot."""
-        # Normalize actions to [-1, 1] range using tanh for safety
         processed_actions = torch.tanh(self.actions)
-
-        # Apply actions based on the configured control mode
-        if self.cfg.control_mode == "velocity":
-            scaled_target_velocities = scale(
-                processed_actions, self.mimic_joint_vel_limits_lower, self.mimic_joint_vel_limits_upper
-            )
-            self.robot.set_joint_velocity_target(scaled_target_velocities, joint_ids=self.mimic_joint_indices_in_robot)
-        elif self.cfg.control_mode == "position":
+        if self.cfg.control_mode == "position":
             scaled_target_positions = self.scale_action(processed_actions)
             self.robot.set_joint_position_target(scaled_target_positions, joint_ids=self.mimic_joint_indices_in_robot)
-        else:
-            raise ValueError(f"Unsupported control_mode: '{self.cfg.control_mode}'.")
+        else:  # velocity
+            scaled_target_velocities = scale(processed_actions, self.mimic_joint_vel_limits_lower, self.mimic_joint_vel_limits_upper)
+            self.robot.set_joint_velocity_target(scaled_target_velocities, joint_ids=self.mimic_joint_indices_in_robot)
 
     def _get_gt(self) -> torch.Tensor:
         """Constructs the ground-truth observation for the mimicry task."""
-        # Get current state of the mimicked joints
         current_mimic_joints_pos = self.robot.data.joint_pos[:, self.mimic_joint_indices_in_robot]
         current_mimic_joints_vel = self.robot.data.joint_vel[:, self.mimic_joint_indices_in_robot]
-
-        # Get the target pose from the animation data for the current animation step
         target_animation_joint_pos = torch.zeros_like(current_mimic_joints_pos)
         if self.max_animation_steps > 0:
             safe_anim_indices = torch.clamp(self.current_animation_step, 0, self.max_animation_steps - 1)
             target_animation_joint_pos = self.animation_pos_data[safe_anim_indices, :]
-
-        # Concatenate into the final ground-truth observation tensor: (current_pos, current_vel, target_pos)
         return torch.cat((current_mimic_joints_pos, current_mimic_joints_vel, target_animation_joint_pos), dim=-1)
 
     def _get_rewards(self) -> torch.Tensor:
         """Calculates rewards based on the robot's mimicry performance."""
-        # Get current robot state and target animation pose
         current_mimic_joints_pos = self.robot.data.joint_pos[:, self.mimic_joint_indices_in_robot]
         current_mimic_joints_vel = self.robot.data.joint_vel[:, self.mimic_joint_indices_in_robot]
         target_animation_joint_pos = torch.zeros_like(current_mimic_joints_pos)
@@ -500,21 +385,12 @@ class MimicEnv(AIRECEnv):
             safe_anim_indices = torch.clamp(self.current_animation_step, 0, self.max_animation_steps - 1)
             target_animation_joint_pos = self.animation_pos_data[safe_anim_indices, :]
 
-        # Compute reward components by calling the reward function
         total_reward, pos_track_rew, staying_alive_rew, current_vel_pen, action_smooth_pen = compute_mimic_rewards_simplified(
-            current_mimic_joints_pos,
-            target_animation_joint_pos,
-            current_mimic_joints_vel,
-            self.actions,
-            self.previous_actions,
-            self.cfg.rewards,
-            self.num_mimic_joints,
-        )
-
-        # Update previous actions for the next step's smoothness penalty
+            current_mimic_joints_pos, target_animation_joint_pos, current_mimic_joints_vel, self.actions,
+            self.previous_actions, self.cfg.rewards, self.num_mimic_joints)
+        
         self.previous_actions = self.actions.clone()
-
-        # Log reward components for debugging and analysis
+        
         log = self.extras["log"]
         log["mimic_pos_tracking_reward"] = pos_track_rew
         log["mimic_staying_alive_reward"] = staying_alive_rew
@@ -523,56 +399,19 @@ class MimicEnv(AIRECEnv):
         log["mimic_total_reward"] = total_reward
         log["current_animation_frame"] = self.current_animation_step.float()
         
-        #WanDB
-        self.extras["counters"] = {}
-
         return total_reward
-
-    def _compute_intermediate_values(self, env_ids: torch.Tensor | None = None):
-        """
-        Computes intermediate values for the environment.
-
-        The core logic for updating animation steps and the ghost robot is centralized
-        in the parent AIRECEnv._compute_intermediate_values method. This method just
-        delegates the call to its parent.
-        """
-        super()._compute_intermediate_values(env_ids)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Determines if episodes have terminated or been truncated."""
-        # Termination condition 1: The animation sequence has completed
         if self.max_animation_steps <= 0:
-            animation_completed = torch.ones_like(self.current_animation_step, dtype=torch.bool, device=self.device)
-            if not hasattr(self, "_no_anim_data_critical_warned_dones"):
-                print("[MimicEnv _get_dones] CRITICAL: max_animation_steps <= 0. Forcing animation_completed=True.")
-                self._no_anim_data_critical_warned_dones = True
+            animation_completed = torch.ones_like(self.current_animation_step, dtype=torch.bool)
         else:
             animation_completed = self.current_animation_step >= (self.max_animation_steps - 1)
-
-        # Truncation condition: Episode length exceeds the maximum allowed time
-        time_out = self.episode_length_buf >= self.max_episode_length
-
-        # Optional termination condition: High tracking error (currently disabled)
-        terminated_by_error = torch.zeros_like(animation_completed, dtype=torch.bool)
-        if self.cfg.termination.terminate_on_high_error:
-            pass
         
-        # Combine termination conditions
-        terminated = animation_completed | terminated_by_error
-        # Truncation occurs on timeout if not already terminated
+        time_out = self.episode_length_buf >= self.max_episode_length
+        terminated = animation_completed
         truncated = time_out & (~terminated)
-
-        # Log episode ending information for debugging
-        if hasattr(self, "global_env_steps_counter") and (torch.any(terminated) or torch.any(truncated)):
-            done_envs = torch.where(terminated | truncated)[0].tolist()
-            terminated_envs = torch.where(terminated)[0].tolist()
-            truncated_envs = torch.where(truncated)[0].tolist()
-            print(f"DEBUG: _get_dones - GlobalStep: {self.global_env_steps_counter} - Episodes ENDING for envs: {done_envs}")
-            if terminated_envs:
-                print(f"DEBUG: _get_dones - TERMINATED envs: {terminated_envs}")
-            if truncated_envs:
-                print(f"DEBUG: _get_dones - TRUNCATED envs: {truncated_envs}")
-
+        
         return terminated, truncated
 
 
@@ -590,50 +429,37 @@ def compute_mimic_rewards_simplified(
     rewards_cfg: RewardsCfg,
     num_tracked_joints: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Calculates the different components of the mimicry reward.
-
-    Args:
-        current_positions: The current joint positions of the robot.
-        target_positions: The target joint positions from the animation.
-        current_velocities: The current joint velocities of the robot.
-        actions: The actions taken in the current step.
-        previous_actions: The actions taken in the previous step.
-        rewards_cfg: The configuration object for reward scaling factors.
-        num_tracked_joints: The number of joints being tracked for mimicry.
-
-    Returns:
-        A tuple containing the total reward and its individual components.
-    """
+    """Calculates the different components of the mimicry reward."""
     batch_size = current_positions.shape[0]
     device = current_positions.device
 
-    # -- Constant "staying alive" reward
+    # -- Liveness Reward: Constant reward for not terminating
     staying_alive_rew_component = torch.full(
         (batch_size,), rewards_cfg.staying_alive_reward, device=device, dtype=torch.float32
     )
 
-    # -- Position tracking reward and velocity penalty (if joints are being tracked)
+    # -- Reward/Penalties that depend on joint tracking
     if num_tracked_joints == 0:
         pos_tracking_reward = torch.zeros(batch_size, device=device)
         current_joint_vel_penalty = torch.zeros(batch_size, device=device)
     else:
-        # Position tracking reward based on squared error (exponentially shaped)
+        # -- Position Tracking Reward: Exponentially scaled reward for matching target joint positions
         pos_error_sq_sum = torch.sum(torch.square(target_positions - current_positions), dim=-1)
         pos_variance_term = rewards_cfg.pos_error_variance_scale * float(num_tracked_joints)
-        pos_variance_term = max(pos_variance_term, 1e-6)  # avoid division by zero
+        pos_variance_term = max(pos_variance_term, 1e-6)  # Avoid division by zero
         pos_tracking_reward = (
             torch.exp(-pos_error_sq_sum / pos_variance_term) * rewards_cfg.joint_pos_tracking_reward_scale
         )
-        # Velocity penalty to discourage excessive speed
+
+        # -- Velocity Penalty: Penalize high joint velocities to encourage smoother movements
         current_vel_sq_sum = torch.sum(torch.square(current_velocities), dim=-1)
         current_joint_vel_penalty = current_vel_sq_sum * rewards_cfg.current_joint_vel_penalty_scale
 
-    # -- Action smoothness penalty to discourage jerky movements
+    # -- Action Smoothness Penalty: Penalize large changes in actions between steps
     action_diff_sq_sum = torch.sum(torch.square(actions - previous_actions), dim=-1)
     action_smoothness_penalty = action_diff_sq_sum * rewards_cfg.action_smoothness_penalty_scale
 
-    # -- Total reward is the sum of all components
+    # -- Total Reward
     total_rewards = (
         pos_tracking_reward + staying_alive_rew_component + current_joint_vel_penalty + action_smoothness_penalty
     )
