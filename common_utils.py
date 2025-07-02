@@ -25,9 +25,20 @@ def make_env(env_cfg, writer, args_cli, obs_stack=1):
 
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
-    # FrameStack expects a gym env
-    if obs_stack > 1:
-        env = FrameStack(env, num_stack=obs_stack)
+    obs, reward = env.reset()
+
+    gym_dict = {}
+    for k, v in obs["policy"].items():
+        obs_shape = v.shape[1] * obs_stack
+        gym_dict[k] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(obs_shape,))
+
+    single_obs_space = gym.spaces.Dict()
+    single_obs_space["policy"] = gym.spaces.Dict(gym_dict)
+    obs_space = gym.vector.utils.batch_space(single_obs_space, env_cfg.scene.num_envs)
+    single_action_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(env_cfg.num_actions,))
+    action_space = gym.vector.utils.batch_space(single_action_space, env_cfg.scene.num_envs)
+    env.unwrapped.set_spaces(single_obs_space, obs_space, single_action_space, action_space)
+    env.obs_stack = obs_stack
 
     # wrap for video recording
     if args_cli.video:
@@ -40,9 +51,13 @@ def make_env(env_cfg, writer, args_cli, obs_stack=1):
         }
         print("[INFO] Recording videos during training.")
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
+    
+    # FrameStack expects a gym env
+    if obs_stack > 1:
+        env = FrameStack(env, obs_stack=obs_stack)
 
     # Isaac Lab wrapper
-    env = IsaacLabWrapper(env)
+    env = IsaacLabWrapper(env, env_cfg.num_eval_envs, debug=env_cfg.debug)
     return env
 
 
@@ -69,7 +84,7 @@ def make_models(env, env_cfg, agent_cfg, dtype):
         **agent_cfg["models"]["value"],
     )
 
-    value_preprocessor = RunningStandardScaler(size=1, device=env.device, dtype=dtype)
+    value_preprocessor = RunningStandardScaler(size=1, device=env.device, dtype=dtype, debug=env_cfg.debug)
 
     print("*****Encoder*****")
     print(encoder)
@@ -109,6 +124,7 @@ def make_trainer(env, agent, agent_cfg, auxiliary_task=None, writer=None):
 def update_env_cfg(args_cli, env_cfg, agent_cfg):
 
     env_cfg.seed = agent_cfg["seed"]
+    env_cfg.debug = agent_cfg["experiment"]["debug"]
 
     # override configurations with either config file or args
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs

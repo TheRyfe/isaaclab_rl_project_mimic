@@ -33,6 +33,20 @@ parser.add_argument("--num_envs", type=int, default=None, help="Number of enviro
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
+# if you have RTX5090, use these args for better rendering
+parser.add_argument(
+    "--renderer",
+    type=str,
+    default="PathTracing",
+    choices=["RayTracedLighting", "PathTracing"],
+    help="Renderer to use."
+)
+parser.add_argument(
+    "--samples_per_pixel_per_frame",
+    type=int,
+    default=1,
+    help="Number of samples per pixel per frame."
+)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -75,7 +89,7 @@ def main(env_cfg, agent_cfg: dict):
     writer = Writer(agent_cfg, play=True)
 
     # Make environment. Order must be gymnasium Env -> FrameStack -> IsaacLab
-    env = make_env(env_cfg, args_cli, agent_cfg["models"]["obs_stack"])
+    env = make_env(env_cfg, writer, args_cli, agent_cfg["models"]["obs_stack"])
 
     # setup models
     policy, value, encoder, value_preprocessor = make_models(env, env_cfg, agent_cfg, dtype)
