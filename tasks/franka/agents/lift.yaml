@@ -63,8 +63,7 @@ experiment:
   debug: 0
   wandb: 1
   wandb_kwargs: {
-    "entity": "simon-gormuzov-waseda-university",
-    "project": "isaac_lab",
-    "group": "franka_lift",
-    "name": "test",
-  }
+    "entity": "DeepMimic",
+    "project": "lift-test",
+    "group": "Basic",
+    "name": "test",}

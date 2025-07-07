@@ -74,15 +74,16 @@ trainer:
 
 # Logging and checkpoint configuration
 experiment:
-  directory: "mimic"
+  directory: "simon-gormuzov-waseda-university"
   experiment_name: "prop_mimic"
   save_checkpoints: 1
-  upload_videos: 1
+  upload_videos: 0 #1 for videos
+  debug: 0
   tb_log: True
   wandb: 1
   wandb_kwargs: {
-    "entity": "simon-gormuzov-waseda-university",
-    "project": "isaac_lab_mimic",
-    "group": "prop_mimic",
-    "name": "base",
+    "entity": "DeepMimic",
+    "project": "SupportWalk",
+    "group": "Basic",
+    "name": "fullbodynobase",
   }

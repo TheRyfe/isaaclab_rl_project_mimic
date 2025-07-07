@@ -18,7 +18,7 @@ AIREC_CFG = ArticulationCfg(
     ###########################################################################
 
     spawn=sim_utils.UsdFileCfg(
-        usd_path="/home/simon/IsaacLab/SimScripts/AIREC_DeepMimic/isaaclab_rl/isaaclab_rl_project_mimic/assets/airec/dry-airec.usd",  # <-- AIREC USD location
+        usd_path="/home/simon/IsaacLab/scripts/AIREC_Packages/isaaclab_rl/isaaclab_rl_project_mimic/assets/airec/dry-airec.usd",  # <-- AIREC USD location
         activate_contact_sensors=True,
         #to fix self collision, look up collision filtering in isaac sim docs
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(

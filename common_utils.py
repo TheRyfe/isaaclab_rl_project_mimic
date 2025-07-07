@@ -37,7 +37,7 @@ def make_env(env_cfg, writer, args_cli, obs_stack=1):
     obs_space = gym.vector.utils.batch_space(single_obs_space, env_cfg.scene.num_envs)
     single_action_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(env_cfg.num_actions,))
     action_space = gym.vector.utils.batch_space(single_action_space, env_cfg.scene.num_envs)
-    env.unwrapped.set_spaces(single_obs_space, obs_space, single_action_space, action_space)
+    #env.unwrapped.set_spaces(single_obs_space, obs_space, single_action_space, action_space)
     env.obs_stack = obs_stack
 
     # wrap for video recording
