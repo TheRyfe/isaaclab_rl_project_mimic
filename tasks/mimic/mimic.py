@@ -49,23 +49,37 @@ from isaaclab.utils.configclass import MISSING
 class RewardsCfg:
     """Configuration for reward components and scales for the mimicry task."""
 
-    joint_pos_tracking_reward_scale: float = 2.5
-    staying_alive_reward: float = 0.01
-    current_joint_vel_penalty_scale: float = -0.0001
-    action_smoothness_penalty_scale: float = -0.005
+    # Position tracking rewards
+    joint_pos_tracking_reward_scale: float = 4.0
     pos_error_variance_scale: float = 0.25
+    use_weighted_pos_tracking: bool = True
+    # Joint importance weights for different body parts
+    head_joint_weight: float = 0.5
+    torso_joint_weight: float = 2.0
+    arm_joint_weight: float = 1.0
+    
+    # Velocity tracking rewards
+    joint_vel_tracking_reward_scale: float = 2.0
+    vel_error_variance_scale: float = 0.5
+    
+    # Orientation rewards
+    orientation_reward_scale: float = 0.5
+    orientation_error_threshold: float = 0.44  # ~25 degrees in radians
+    
+    # Penalties
+    current_joint_vel_penalty_scale: float = -0.0001
+    action_smoothness_penalty_scale: float = -0.01
+    joint_acceleration_penalty_scale: float = -0.01
+    energy_penalty_scale: float = -0.001
+    
+    # Other rewards
+    staying_alive_reward: float = 0.002
 
 
 @configclass
 class TerminationCfg:
     """Configuration for episode termination conditions."""
-
-    terminate_on_high_error: bool = False
-    max_avg_pos_error_threshold: float = 0.8
-    max_avg_vel_error_threshold: float = 1.5
-    pos_error_running_avg_alpha: float = 0.05
-    vel_error_running_avg_alpha: float = 0.05
-    error_termination_grace_period_steps: int = 10
+    pass
 
 
 # -- Ghost Robot Configuration
@@ -536,38 +550,18 @@ class MimicEnv(AIRECEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Determines if episodes have terminated or been truncated."""
-        # Termination condition 1: The animation sequence has completed
+        # Termination condition: The animation sequence has completed (natural end)
         if self.max_animation_steps <= 0:
-            animation_completed = torch.ones_like(self.current_animation_step, dtype=torch.bool, device=self.device)
+            terminated = torch.ones_like(self.current_animation_step, dtype=torch.bool, device=self.device)
             if not hasattr(self, "_no_anim_data_critical_warned_dones"):
                 print("[MimicEnv _get_dones] CRITICAL: max_animation_steps <= 0. Forcing animation_completed=True.")
                 self._no_anim_data_critical_warned_dones = True
         else:
-            animation_completed = self.current_animation_step >= (self.max_animation_steps - 1)
+            terminated = self.current_animation_step >= (self.max_animation_steps - 1)
 
         # Truncation condition: Episode length exceeds the maximum allowed time
         time_out = self.episode_length_buf >= self.max_episode_length
-
-        # Optional termination condition: High tracking error (currently disabled)
-        terminated_by_error = torch.zeros_like(animation_completed, dtype=torch.bool)
-        if self.cfg.termination.terminate_on_high_error:
-            pass
-        
-        # Combine termination conditions
-        terminated = animation_completed | terminated_by_error
-        # Truncation occurs on timeout if not already terminated
         truncated = time_out & (~terminated)
-
-        # Log episode ending information for debugging
-        if hasattr(self, "global_env_steps_counter") and (torch.any(terminated) or torch.any(truncated)):
-            done_envs = torch.where(terminated | truncated)[0].tolist()
-            terminated_envs = torch.where(terminated)[0].tolist()
-            truncated_envs = torch.where(truncated)[0].tolist()
-            print(f"DEBUG: _get_dones - GlobalStep: {self.global_env_steps_counter} - Episodes ENDING for envs: {done_envs}")
-            if terminated_envs:
-                print(f"DEBUG: _get_dones - TERMINATED envs: {terminated_envs}")
-            if truncated_envs:
-                print(f"DEBUG: _get_dones - TRUNCATED envs: {truncated_envs}")
 
         return terminated, truncated
 
