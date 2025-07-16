@@ -570,13 +570,15 @@ class AIRECEnv(DirectRLEnv):
                         # if self.num_envs > 0:
                         #     print(f"[GOAL_STATE_DEBUG Step: {self.global_env_steps_counter}] Env 0: AnimFrame={self.current_animation_step[0].item()}, TargetPos={target_pos_ghost[0, :3].tolist()}")
                         
-                        full_ghost_pos = self.ghost_robot.data.default_joint_pos.clone()
                         if env_ids is None:
+                            full_ghost_pos = self.ghost_robot.data.default_joint_pos.clone()
                             full_ghost_pos[:, indices_to_use_for_ghost] = target_pos_ghost
+                            self.ghost_robot.write_joint_state_to_sim(full_ghost_pos, torch.zeros_like(full_ghost_pos), env_ids=env_ids)
                         else:
-                            full_ghost_pos.index_put_((env_ids[:, None], indices_to_use_for_ghost), target_pos_ghost[env_ids, :])
-                        
-                        self.ghost_robot.write_joint_state_to_sim(full_ghost_pos, torch.zeros_like(full_ghost_pos), env_ids=env_ids)
+                            # When resetting specific environments, only pass data for those environments
+                            full_ghost_pos = self.ghost_robot.data.default_joint_pos[env_ids].clone()
+                            full_ghost_pos[:, indices_to_use_for_ghost] = target_pos_ghost[env_ids, :]
+                            self.ghost_robot.write_joint_state_to_sim(full_ghost_pos, torch.zeros_like(full_ghost_pos), env_ids=env_ids)
                     else:
                         if not hasattr(self, "_warned_no_ghost_indices"):
                             print("WARNING: AIRECEnv - No valid ghost indices. Skipping ghost update.")

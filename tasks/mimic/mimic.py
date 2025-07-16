@@ -79,7 +79,14 @@ class RewardsCfg:
 @configclass
 class TerminationCfg:
     """Configuration for episode termination conditions."""
-    pass
+    # Joint limit termination
+    enable_joint_limit_termination: bool = True
+    joint_limit_buffer: float = 0.95  # Terminate at 95% of soft limits
+    
+    # Torso tilt termination
+    enable_torso_tilt_termination: bool = True
+    torso_tilt_limit: float = 0.785  # 45 degrees in radians
+    torso_joints_to_check: list[str] = field(default_factory=lambda: ["torso_joint_1", "torso_joint_2"])
 
 
 # -- Ghost Robot Configuration
@@ -366,6 +373,8 @@ class MimicEnv(AIRECEnv):
             "mimic_action_smoothness_penalty": torch.zeros(self.num_envs, device=self.device),
             "mimic_total_reward": torch.zeros(self.num_envs, device=self.device),
             "current_animation_frame": torch.zeros(self.num_envs, device=self.device, dtype=torch.float32),
+            "joint_limit_violations": torch.zeros(self.num_envs, device=self.device, dtype=torch.float32),
+            "torso_tilt_violations": torch.zeros(self.num_envs, device=self.device, dtype=torch.float32),
         }
         if hasattr(self, "animation_pos_data") and self.max_animation_steps <= 0:
             print("[MimicEnv __init__] WARNING: Animation data appears empty after full loading. Mimicry may not function.")
@@ -535,6 +544,17 @@ class MimicEnv(AIRECEnv):
         log["mimic_action_smoothness_penalty"] = action_smooth_pen
         log["mimic_total_reward"] = total_reward
         log["current_animation_frame"] = self.current_animation_step.float()
+        
+        # Update termination tracking
+        if hasattr(self, "joint_limit_violations"):
+            log["joint_limit_violations"] = self.joint_limit_violations
+        else:
+            log["joint_limit_violations"] = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+            
+        if hasattr(self, "torso_tilt_violations"):
+            log["torso_tilt_violations"] = self.torso_tilt_violations
+        else:
+            log["torso_tilt_violations"] = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
 
         return total_reward
 
@@ -558,6 +578,45 @@ class MimicEnv(AIRECEnv):
                 self._no_anim_data_critical_warned_dones = True
         else:
             terminated = self.current_animation_step >= (self.max_animation_steps - 1)
+
+        # Joint limit termination
+        if self.cfg.termination.enable_joint_limit_termination:
+            current_pos = self.robot.data.joint_pos[:, self.mimic_joint_indices_in_robot]
+            lower_limits = self.robot.data.soft_joint_pos_limits[:, self.mimic_joint_indices_in_robot, 0]
+            upper_limits = self.robot.data.soft_joint_pos_limits[:, self.mimic_joint_indices_in_robot, 1]
+            
+            buffer = self.cfg.termination.joint_limit_buffer
+            joint_limit_violated = torch.any(
+                (current_pos < lower_limits * buffer) | (current_pos > upper_limits * buffer),
+                dim=1
+            )
+            terminated = terminated | joint_limit_violated
+            
+            # Store for logging (as float for mean calculation)
+            if not hasattr(self, "joint_limit_violations"):
+                self.joint_limit_violations = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+            self.joint_limit_violations = joint_limit_violated.float()
+        
+        # Torso tilt termination
+        if self.cfg.termination.enable_torso_tilt_termination:
+            # Get torso joint indices
+            torso_indices = []
+            for joint_name in self.cfg.termination.torso_joints_to_check:
+                if joint_name in self.robot.joint_names:
+                    torso_indices.append(self.robot.joint_names.index(joint_name))
+            
+            if torso_indices:
+                torso_positions = self.robot.data.joint_pos[:, torso_indices]
+                torso_tilt_violated = torch.any(
+                    torch.abs(torso_positions) > self.cfg.termination.torso_tilt_limit,
+                    dim=1
+                )
+                terminated = terminated | torso_tilt_violated
+                
+                # Store for logging (as float for mean calculation)
+                if not hasattr(self, "torso_tilt_violations"):
+                    self.torso_tilt_violations = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+                self.torso_tilt_violations = torso_tilt_violated.float()
 
         # Truncation condition: Episode length exceeds the maximum allowed time
         time_out = self.episode_length_buf >= self.max_episode_length
