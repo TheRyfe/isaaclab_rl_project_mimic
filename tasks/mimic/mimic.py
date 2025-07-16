@@ -462,23 +462,23 @@ class MimicEnv(AIRECEnv):
 
     def _reset_idx(self, env_ids: torch.Tensor):
         """Resets the state for specified environments."""
-        if self.num_envs > 0 and env_ids.numel() > 0:
-            print(
-                f"DEBUG: MimicEnv._reset_idx - START - env_ids: {env_ids.tolist()}, current_animation_step BEFORE any action: {self.current_animation_step[env_ids].tolist()}"
-            )
+        # if self.num_envs > 0 and env_ids.numel() > 0:
+        #     print(
+        #         f"DEBUG: MimicEnv._reset_idx - START - env_ids: {env_ids.tolist()}, current_animation_step BEFORE any action: {self.current_animation_step[env_ids].tolist()}"
+        #     )
         # Reset animation-specific states first
         if env_ids.numel() > 0:
             self.current_animation_step[env_ids] = 0
             self.previous_actions[env_ids] = 0.0
-            print(f"DEBUG: MimicEnv._reset_idx - Set current_animation_step[{env_ids.tolist()}] to 0.")
+            # print(f"DEBUG: MimicEnv._reset_idx - Set current_animation_step[{env_ids.tolist()}] to 0.")
 
         # Call parent reset logic
         super()._reset_idx(env_ids)
 
-        if self.num_envs > 0 and env_ids.numel() > 0:
-            print(
-                f"DEBUG: MimicEnv._reset_idx - END - env_ids: {env_ids.tolist()}, current_animation_step AFTER super()._reset_idx(): {self.current_animation_step[env_ids].tolist()}"
-            )
+        # if self.num_envs > 0 and env_ids.numel() > 0:
+            # print(
+            #     f"DEBUG: MimicEnv._reset_idx - END - env_ids: {env_ids.tolist()}, current_animation_step AFTER super()._reset_idx(): {self.current_animation_step[env_ids].tolist()}"
+            # )
 
     def _apply_action(self) -> None:
         """Processes and applies the actions from the RL agent to the robot."""
