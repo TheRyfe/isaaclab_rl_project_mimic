@@ -114,9 +114,22 @@ class ExternalDisturbanceCfg:
     # Probability of applying disturbance per environment per step
     disturbance_probability: float = 0.01  # 1% chance per step per env
     
+    # Episode start timeout (in seconds) - no forces applied during this period
+    episode_start_timeout: float = 4.0
+    
+    # Directional bias parameters (for simulating leaning)
+    # Bias values are normalized direction weights (will be normalized to unit vector)
+    directional_bias: tuple[float, float, float] = (0.0, 0.0, -1.0)  # Default: downward bias
+    bias_strength: float = 0.6  # 0.0 = pure random, 1.0 = pure bias direction
+    
     # Visualization parameters
     enable_force_visualization: bool = True
     force_arrow_scale: float = 1.0  # Scale factor: arrow length = force magnitude * scale
+    
+    # Arrow shape parameters
+    arrow_length_scale: float = 1.0  # Length scaling factor for arrow
+    arrow_thickness: float = 0.3  # Cross-sectional thickness (Y and Z dimensions)
+    arrow_color: tuple[float, float, float] = (1.0, 0.0, 0.0)  # RGB color (red by default)
 
 
 # -- Ghost Robot Configuration
@@ -442,6 +455,7 @@ class MimicEnv(AIRECEnv):
         self.disturbance_torques = torch.zeros((self.num_envs, 3), device=self.device)
         self.disturbance_remaining_time = torch.zeros(self.num_envs, device=self.device)
         self.disturbance_cooldown_time = torch.zeros(self.num_envs, device=self.device)
+        self.episode_start_time = torch.zeros(self.num_envs, device=self.device)
         
         if self.cfg.external_disturbance.enable_disturbances:
             print(f"[INFO] External disturbance system initialized:")
@@ -470,15 +484,20 @@ class MimicEnv(AIRECEnv):
         # Initialize force visualization markers if enabled
         if self.cfg.external_disturbance.enable_disturbances and self.cfg.external_disturbance.enable_force_visualization:
             try:
-                # Create arrow marker configuration
+                # Create arrow marker configuration with configurable parameters
+                base_arrow_scale = (
+                    self.cfg.external_disturbance.arrow_length_scale,
+                    self.cfg.external_disturbance.arrow_thickness,
+                    self.cfg.external_disturbance.arrow_thickness
+                )
                 force_arrow_cfg = VisualizationMarkersCfg(
                     prim_path="/World/Visuals/force_arrows",
                     markers={
                         "arrow": sim_utils.UsdFileCfg(
                             usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd",
-                            scale=(1.0, 0.3, 0.3),  # Base scale, will be adjusted dynamically
+                            scale=base_arrow_scale,  # Use configurable scale
                             visual_material=sim_utils.PreviewSurfaceCfg(
-                                diffuse_color=(1.0, 0.0, 0.0),  # Red color
+                                diffuse_color=self.cfg.external_disturbance.arrow_color,  # Use configurable color
                                 roughness=0.4,
                                 metallic=0.0
                             ),
@@ -596,6 +615,7 @@ class MimicEnv(AIRECEnv):
                 self.disturbance_torques[env_ids] = 0.0
                 self.disturbance_remaining_time[env_ids] = 0.0
                 self.disturbance_cooldown_time[env_ids] = 0.0
+                self.episode_start_time[env_ids] = 0.0
                 
                 # Clear any active forces on reset
                 try:
@@ -723,9 +743,13 @@ class MimicEnv(AIRECEnv):
         # Update timers
         self.disturbance_remaining_time = torch.clamp(self.disturbance_remaining_time - dt, min=0.0)
         self.disturbance_cooldown_time = torch.clamp(self.disturbance_cooldown_time - dt, min=0.0)
+        self.episode_start_time = self.episode_start_time + dt
+        
+        # Check if we're still in the episode start timeout period
+        in_timeout = self.episode_start_time < self.cfg.external_disturbance.episode_start_timeout
         
         # Find environments that can receive new disturbances
-        can_disturb = (self.disturbance_remaining_time == 0) & (self.disturbance_cooldown_time == 0)
+        can_disturb = (self.disturbance_remaining_time == 0) & (self.disturbance_cooldown_time == 0) & (~in_timeout)
         
         # Randomly select which environments to disturb
         disturb_mask = can_disturb & (torch.rand(self.num_envs, device=self.device) < self.cfg.external_disturbance.disturbance_probability)
@@ -744,13 +768,33 @@ class MimicEnv(AIRECEnv):
                 device=self.device
             )
             
-            # Generate random force directions (unit vectors) only for disturbed environments
-            random_directions = torch.zeros(self.num_envs, 3, device=self.device)
-            random_directions[disturb_mask] = torch.randn(num_disturbed, 3, device=self.device)
-            random_directions[disturb_mask] = random_directions[disturb_mask] / torch.norm(random_directions[disturb_mask], dim=1, keepdim=True)
+            # Generate force directions with bias
+            if cfg.bias_strength > 0.0:
+                # Normalize the bias direction
+                bias_dir = torch.tensor(cfg.directional_bias, device=self.device, dtype=torch.float32)
+                bias_dir = bias_dir / torch.norm(bias_dir)
+                
+                # Generate random directions
+                random_directions = torch.zeros(self.num_envs, 3, device=self.device)
+                random_directions[disturb_mask] = torch.randn(num_disturbed, 3, device=self.device)
+                random_directions[disturb_mask] = random_directions[disturb_mask] / torch.norm(random_directions[disturb_mask], dim=1, keepdim=True)
+                
+                # Blend random and bias directions
+                final_directions = torch.zeros(self.num_envs, 3, device=self.device)
+                final_directions[disturb_mask] = (
+                    cfg.bias_strength * bias_dir.unsqueeze(0) + 
+                    (1.0 - cfg.bias_strength) * random_directions[disturb_mask]
+                )
+                # Normalize the blended direction
+                final_directions[disturb_mask] = final_directions[disturb_mask] / torch.norm(final_directions[disturb_mask], dim=1, keepdim=True)
+            else:
+                # Pure random directions (no bias)
+                final_directions = torch.zeros(self.num_envs, 3, device=self.device)
+                final_directions[disturb_mask] = torch.randn(num_disturbed, 3, device=self.device)
+                final_directions[disturb_mask] = final_directions[disturb_mask] / torch.norm(final_directions[disturb_mask], dim=1, keepdim=True)
             
             # Apply force only to disturbed environments
-            self.disturbance_forces[disturb_mask] = (force_magnitudes[disturb_mask].unsqueeze(1) * random_directions[disturb_mask])
+            self.disturbance_forces[disturb_mask] = (force_magnitudes[disturb_mask].unsqueeze(1) * final_directions[disturb_mask])
             
             # Set durations for new disturbances
             self.disturbance_remaining_time[disturb_mask] = sample_uniform(
