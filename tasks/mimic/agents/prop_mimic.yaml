@@ -70,7 +70,7 @@ agent:
 # Trainer configuration
 trainer:
   num_eval_envs: 16
-  max_global_timesteps_M: 1000
+  max_global_timesteps_M: 100
 
 # Logging and checkpoint configuration
 experiment:

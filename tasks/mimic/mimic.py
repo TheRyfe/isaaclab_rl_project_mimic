@@ -30,6 +30,9 @@ from tasks.mimic.airec import AIRECEnv, AIRECEnvCfg, scale
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import VecEnvObs
+from isaaclab.envs.common import VecEnvStepReturn
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+from isaaclab.markers.config import RED_ARROW_X_MARKER_CFG
 from isaaclab.sim.schemas.schemas_cfg import (
     ArticulationRootPropertiesCfg,
     CollisionPropertiesCfg,
@@ -39,6 +42,8 @@ from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
 from isaaclab.sim.spawners.materials import PreviewSurfaceCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.configclass import MISSING
+from isaaclab.utils.math import sample_uniform, quat_from_euler_xyz, quat_apply_inverse
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 # =============================================================================
 # Configuration
@@ -80,13 +85,38 @@ class RewardsCfg:
 class TerminationCfg:
     """Configuration for episode termination conditions."""
     # Joint limit termination
-    enable_joint_limit_termination: bool = True
+    enable_joint_limit_termination: bool = False
     joint_limit_buffer: float = 0.95  # Terminate at 95% of soft limits
     
     # Torso tilt termination
-    enable_torso_tilt_termination: bool = True
+    enable_torso_tilt_termination: bool = False
     torso_tilt_limit: float = 0.785  # 45 degrees in radians
     torso_joints_to_check: list[str] = field(default_factory=lambda: ["torso_joint_1", "torso_joint_2"])
+
+
+@configclass
+class ExternalDisturbanceCfg:
+    """Configuration for external force disturbances."""
+    enable_disturbances: bool = True
+    
+    # Target body configuration
+    target_body_name: str = "right_arm_link_5"
+    
+    # Force parameters (in Newtons, applied in global/world coordinate frame)
+    force_magnitude_range: tuple[float, float] = (500.0, 2000.0)
+    
+    # Duration parameters (in seconds)
+    duration_range: tuple[float, float] = (0.5, 1.5)  # Shorter duration for more frequent changes
+    
+    # Interval between disturbances (in seconds)
+    interval_range: tuple[float, float] = (0.5, 2.0)  # Shorter cooldown
+    
+    # Probability of applying disturbance per environment per step
+    disturbance_probability: float = 0.01  # 1% chance per step per env
+    
+    # Visualization parameters
+    enable_force_visualization: bool = True
+    force_arrow_scale: float = 1.0  # Scale factor: arrow length = force magnitude * scale
 
 
 # -- Ghost Robot Configuration
@@ -126,6 +156,7 @@ class MimicEnvCfg(AIRECEnvCfg):
     # -- Sub-configurations
     rewards: RewardsCfg = RewardsCfg()
     termination: TerminationCfg = TerminationCfg()
+    external_disturbance: ExternalDisturbanceCfg = ExternalDisturbanceCfg()
 
     # -- Ghost Visualizer Configuration
     enable_ghost_visualizer: bool = True
@@ -375,7 +406,50 @@ class MimicEnv(AIRECEnv):
             "current_animation_frame": torch.zeros(self.num_envs, device=self.device, dtype=torch.float32),
             "joint_limit_violations": torch.zeros(self.num_envs, device=self.device, dtype=torch.float32),
             "torso_tilt_violations": torch.zeros(self.num_envs, device=self.device, dtype=torch.float32),
+            "disturbance_active": torch.zeros(self.num_envs, device=self.device, dtype=torch.float32),
+            "disturbance_force_magnitude": torch.zeros(self.num_envs, device=self.device, dtype=torch.float32),
         }
+        
+        # -- Initialize external disturbance system
+        if self.cfg.external_disturbance.enable_disturbances:
+            # Find the target body index
+            body_ids, body_names = self.robot.find_bodies(self.cfg.external_disturbance.target_body_name)
+            if body_ids:
+                self.disturbance_body_id = body_ids[0]
+                print(f"[INFO] External disturbance target: {body_names[0]} (body_id: {self.disturbance_body_id})")
+                print(f"[DEBUG] Robot type: {type(self.robot)}")
+                print(f"[DEBUG] Robot prim path: {self.robot.cfg.prim_path}")
+                print(f"[DEBUG] Total robot bodies: {len(self.robot.body_names)}")
+                
+                # Check robot configuration for force support
+                print(f"[DEBUG] Robot spawn config: {type(self.robot.cfg.spawn)}")
+                if hasattr(self.robot.cfg.spawn, 'rigid_props'):
+                    print(f"[DEBUG] Rigid body properties: {self.robot.cfg.spawn.rigid_props}")
+                if hasattr(self.robot.cfg.spawn, 'articulation_props'):
+                    print(f"[DEBUG] Articulation properties: {self.robot.cfg.spawn.articulation_props}")
+                    
+                # Check if external forces are enabled
+                print(f"[DEBUG] Robot methods related to force: {[m for m in dir(self.robot) if 'force' in m.lower() or 'external' in m.lower()]}")
+                
+            else:
+                print(f"[WARNING] Could not find body '{self.cfg.external_disturbance.target_body_name}' for disturbances")
+                print(f"[DEBUG] Available bodies: {self.robot.body_names[:20]}...")  # Show first 20 body names
+                self.cfg.external_disturbance.enable_disturbances = False
+                self.disturbance_body_id = None
+        
+        # Initialize disturbance tracking tensors
+        self.disturbance_forces = torch.zeros((self.num_envs, 3), device=self.device)
+        self.disturbance_torques = torch.zeros((self.num_envs, 3), device=self.device)
+        self.disturbance_remaining_time = torch.zeros(self.num_envs, device=self.device)
+        self.disturbance_cooldown_time = torch.zeros(self.num_envs, device=self.device)
+        
+        if self.cfg.external_disturbance.enable_disturbances:
+            print(f"[INFO] External disturbance system initialized:")
+            print(f"  - Force range: {self.cfg.external_disturbance.force_magnitude_range} N")
+            print(f"  - Duration range: {self.cfg.external_disturbance.duration_range} s")
+            print(f"  - Interval range: {self.cfg.external_disturbance.interval_range} s")
+            print(f"  - Probability: {self.cfg.external_disturbance.disturbance_probability}")
+            print(f"  - Visualization: {self.cfg.external_disturbance.enable_force_visualization}")
         if hasattr(self, "animation_pos_data") and self.max_animation_steps <= 0:
             print("[MimicEnv __init__] WARNING: Animation data appears empty after full loading. Mimicry may not function.")
         print("DEBUG: MimicEnv.__init__ - END")
@@ -392,6 +466,50 @@ class MimicEnv(AIRECEnv):
             self.ghost_robot = Articulation(self.cfg.ghost_robot_cfg)
             self.scene.articulations["ghost_robot"] = self.ghost_robot
             print("[INFO] Ghost visualizer robot added to the scene.")
+            
+        # Initialize force visualization markers if enabled
+        if self.cfg.external_disturbance.enable_disturbances and self.cfg.external_disturbance.enable_force_visualization:
+            try:
+                # Create arrow marker configuration
+                force_arrow_cfg = VisualizationMarkersCfg(
+                    prim_path="/World/Visuals/force_arrows",
+                    markers={
+                        "arrow": sim_utils.UsdFileCfg(
+                            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd",
+                            scale=(1.0, 0.3, 0.3),  # Base scale, will be adjusted dynamically
+                            visual_material=sim_utils.PreviewSurfaceCfg(
+                                diffuse_color=(1.0, 0.0, 0.0),  # Red color
+                                roughness=0.4,
+                                metallic=0.0
+                            ),
+                        )
+                    }
+                )
+                
+                print(f"[DEBUG] Creating visualization markers with custom config")
+                print(f"[DEBUG] Arrow marker config details: {force_arrow_cfg.markers}")
+                
+                # Initialize the visualization markers
+                self.force_visualization_markers = VisualizationMarkers(force_arrow_cfg)
+                print("[INFO] Force visualization markers initialized successfully.")
+                print(f"[DEBUG] Marker prototypes: {self.force_visualization_markers.num_prototypes}")
+                
+            except Exception as e:
+                print(f"[ERROR] Failed to initialize force visualization markers: {e}")
+                print(f"[DEBUG] Trying fallback with original config...")
+                try:
+                    # Fallback to original config
+                    force_arrow_cfg = RED_ARROW_X_MARKER_CFG.copy()
+                    force_arrow_cfg.prim_path = "/World/Visuals/force_arrows"
+                    self.force_visualization_markers = VisualizationMarkers(force_arrow_cfg)
+                    print("[INFO] Fallback force visualization markers initialized.")
+                except Exception as e2:
+                    print(f"[ERROR] Fallback also failed: {e2}")
+                    self.force_visualization_markers = None
+        else:
+            self.force_visualization_markers = None
+            print("[INFO] Force visualization disabled in config")
+            
         print("DEBUG: MimicEnv._setup_scene - END")
 
     def _load_animation_data_static(self, animation_file_path: str, csv_columns: list[str]):
@@ -471,6 +589,36 @@ class MimicEnv(AIRECEnv):
             self.current_animation_step[env_ids] = 0
             self.previous_actions[env_ids] = 0.0
             # print(f"DEBUG: MimicEnv._reset_idx - Set current_animation_step[{env_ids.tolist()}] to 0.")
+            
+            # Reset disturbance states
+            if self.cfg.external_disturbance.enable_disturbances:
+                self.disturbance_forces[env_ids] = 0.0
+                self.disturbance_torques[env_ids] = 0.0
+                self.disturbance_remaining_time[env_ids] = 0.0
+                self.disturbance_cooldown_time[env_ids] = 0.0
+                
+                # Clear any active forces on reset
+                try:
+                    # Clear all forces for the reset environments
+                    zero_forces = torch.zeros((self.num_envs, len(self.robot.body_names), 3), device=self.device)
+                    zero_torques = torch.zeros((self.num_envs, len(self.robot.body_names), 3), device=self.device)
+                    
+                    self.robot.set_external_force_and_torque(
+                        forces=zero_forces,
+                        torques=zero_torques,
+                        env_ids=env_ids
+                    )
+                except Exception as e:
+                    print(f"[WARNING] Could not clear forces on reset: {e}")
+            
+            # Clear force visualizations on reset
+            if self.force_visualization_markers is not None:
+                # If all environments are being reset, hide all arrows
+                if len(env_ids) == self.num_envs:
+                    self.force_visualization_markers.set_visibility(False)
+                else:
+                    # Otherwise, update visualization to reflect cleared forces
+                    self._visualize_forces()
 
         # Call parent reset logic
         super()._reset_idx(env_ids)
@@ -555,8 +703,301 @@ class MimicEnv(AIRECEnv):
             log["torso_tilt_violations"] = self.torso_tilt_violations
         else:
             log["torso_tilt_violations"] = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        
+        # Update disturbance tracking
+        log["disturbance_active"] = (self.disturbance_remaining_time > 0).float()
+        log["disturbance_force_magnitude"] = torch.norm(self.disturbance_forces, dim=1)
 
         return total_reward
+
+    def _apply_external_disturbances(self):
+        """Apply random external disturbances to the robot."""
+        if not self.cfg.external_disturbance.enable_disturbances:
+            return
+            
+        if not hasattr(self, 'disturbance_body_id') or self.disturbance_body_id is None:
+            return
+        
+        dt = self.control_dt
+        
+        # Update timers
+        self.disturbance_remaining_time = torch.clamp(self.disturbance_remaining_time - dt, min=0.0)
+        self.disturbance_cooldown_time = torch.clamp(self.disturbance_cooldown_time - dt, min=0.0)
+        
+        # Find environments that can receive new disturbances
+        can_disturb = (self.disturbance_remaining_time == 0) & (self.disturbance_cooldown_time == 0)
+        
+        # Randomly select which environments to disturb
+        disturb_mask = can_disturb & (torch.rand(self.num_envs, device=self.device) < self.cfg.external_disturbance.disturbance_probability)
+        
+        if disturb_mask.any():
+            num_disturbed = disturb_mask.sum()
+            cfg = self.cfg.external_disturbance
+            print(f"[DEBUG] Applying disturbances to {num_disturbed} environments: {torch.where(disturb_mask)[0].tolist()}")
+            
+            # Generate random force magnitudes
+            force_magnitudes = torch.zeros(self.num_envs, device=self.device)
+            force_magnitudes[disturb_mask] = sample_uniform(
+                cfg.force_magnitude_range[0], 
+                cfg.force_magnitude_range[1],
+                (num_disturbed,), 
+                device=self.device
+            )
+            
+            # Generate random force directions (unit vectors) only for disturbed environments
+            random_directions = torch.zeros(self.num_envs, 3, device=self.device)
+            random_directions[disturb_mask] = torch.randn(num_disturbed, 3, device=self.device)
+            random_directions[disturb_mask] = random_directions[disturb_mask] / torch.norm(random_directions[disturb_mask], dim=1, keepdim=True)
+            
+            # Apply force only to disturbed environments
+            self.disturbance_forces[disturb_mask] = (force_magnitudes[disturb_mask].unsqueeze(1) * random_directions[disturb_mask])
+            
+            # Set durations for new disturbances
+            self.disturbance_remaining_time[disturb_mask] = sample_uniform(
+                cfg.duration_range[0],
+                cfg.duration_range[1],
+                (num_disturbed,),
+                device=self.device
+            )
+            
+            # Set cooldown for next disturbance
+            self.disturbance_cooldown_time[disturb_mask] = sample_uniform(
+                cfg.interval_range[0],
+                cfg.interval_range[1],
+                (num_disturbed,),
+                device=self.device
+            )
+        
+        # Clear forces for environments where disturbance has ended
+        force_ended = self.disturbance_remaining_time == 0
+        self.disturbance_forces[force_ended] = 0.0
+        
+        # Apply external forces to robot bodies
+        if self.disturbance_forces.any():
+            active_envs = torch.where(torch.norm(self.disturbance_forces, dim=1) > 0)[0]
+            if len(active_envs) > 0:
+                # Print active forces
+                if not hasattr(self, "_last_active_print_time") or (self.global_env_steps_counter % 60 == 0):
+                    print(f"[DEBUG] Active forces in {len(active_envs)} envs: {active_envs.tolist()[:5]}")
+                    print(f"[DEBUG] Force magnitudes: {torch.norm(self.disturbance_forces[active_envs[:3]], dim=1).tolist()}")
+                    self._last_active_print_time = self.global_env_steps_counter
+                
+                # Apply external forces using Isaac Lab's standard API only
+                try:
+                    # Get body orientations (quaternions) for the disturbance body
+                    # body_state_w is (num_envs, num_bodies, 13) where indices 3:7 are quaternion (w,x,y,z)
+                    body_orientations = self.robot.data.body_state_w[:, self.disturbance_body_id, 3:7]
+                    
+                    # Transform global forces to local body frame
+                    # quat_apply_inverse rotates vectors from world to body frame
+                    local_forces = quat_apply_inverse(body_orientations, self.disturbance_forces)
+                    
+                    # Create force tensor in proper format: (num_envs, num_bodies, 3)
+                    external_forces = torch.zeros((self.num_envs, len(self.robot.body_names), 3), device=self.device)
+                    external_forces[:, self.disturbance_body_id, :] = local_forces
+                    
+                    external_torques = torch.zeros_like(external_forces)
+                    
+                    # Apply using Isaac Lab API
+                    self.robot.set_external_force_and_torque(
+                        forces=external_forces,
+                        torques=external_torques
+                    )
+                    
+                    print(f"[DEBUG] Applied forces using Isaac Lab standard API with global-to-local transformation")
+                    
+                except Exception as e:
+                    print(f"[DEBUG] Force application failed: {e}")
+
+    def _visualize_forces(self):
+        """Visualize the external forces using arrow markers."""
+        if self.force_visualization_markers is None:
+            return
+            
+        # Find which environments have active forces
+        active_forces = torch.norm(self.disturbance_forces, dim=1) > 0
+        num_active = active_forces.sum().item()
+        
+        if num_active == 0:
+            # Hide all markers when no forces are active
+            self.force_visualization_markers.set_visibility(False)
+            return
+            
+        try:
+            # Get the positions where forces are applied
+            body_positions = self.robot.data.body_state_w[:, self.disturbance_body_id, :3]
+            
+            # Prepare data for all environments (we'll use marker indices to show only active ones)
+            all_positions = body_positions.clone()
+            
+            # Convert force vectors to arrow orientations
+            # Default orientation: arrow points along +X axis
+            # We need to rotate it to align with force direction
+            orientations = torch.zeros((self.num_envs, 4), device=self.device)
+            orientations[:, 0] = 1.0  # Default quaternion (w=1, x=y=z=0)
+            
+            # Calculate arrow scales based on force magnitude
+            force_magnitudes = torch.norm(self.disturbance_forces, dim=1)
+            max_expected_force = self.cfg.external_disturbance.force_magnitude_range[1]
+            
+            # Scale arrows: length proportional to force magnitude
+            # Default arrow scale from config is (1.0, 0.1, 0.1) for X, Y, Z
+            base_scale = torch.tensor([1.0, 0.5, 0.5], device=self.device)
+            scales = torch.zeros((self.num_envs, 3), device=self.device)
+            
+            # For active forces, calculate proper orientation and scale
+            if num_active > 0:
+                active_indices = torch.where(active_forces)[0]
+                
+                for idx in active_indices:
+                    force_vec = self.disturbance_forces[idx]
+                    force_mag = force_magnitudes[idx]
+                    
+                    if force_mag > 0:
+                        # Normalize force vector to get direction
+                        force_dir = force_vec / force_mag
+                        
+                        # Calculate quaternion to rotate from +X to force direction
+                        # This is a simplified version - for more accuracy, use proper quaternion calculations
+                        orientations[idx] = self._vector_to_quaternion(force_dir)
+                        
+                        # Scale arrow based on force magnitude
+                        scale_factor = (force_mag / max_expected_force) * 2.0  # Scale factor for visibility
+                        scales[idx] = base_scale * scale_factor
+            
+            # Create marker indices for only active forces
+            if num_active > 0:
+                # Extract only the active force data
+                active_positions = all_positions[active_forces]
+                active_orientations = orientations[active_forces]
+                active_scales = scales[active_forces]
+                
+                # All arrows use the same prototype (index 0)
+                active_marker_indices = torch.zeros(num_active, dtype=torch.long, device=self.device)
+                
+                # Visualize only active arrows
+                self.force_visualization_markers.visualize(
+                    translations=active_positions,
+                    orientations=active_orientations,
+                    scales=active_scales,
+                    marker_indices=active_marker_indices
+                )
+                self.force_visualization_markers.set_visibility(True)
+                
+                # Debug print (occasional)
+                if self.global_env_steps_counter % 60 == 0:
+                    print(f"[DEBUG] Visualizing {num_active} force arrows")
+                    for i in range(min(3, num_active)):
+                        idx = torch.where(active_forces)[0][i]
+                        print(f"  Arrow {i}: pos={all_positions[idx].cpu().numpy()}, force_mag={force_magnitudes[idx]:.1f}N")
+            
+        except Exception as e:
+            print(f"[ERROR] Force visualization failed: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _vector_to_quaternion(self, vec: torch.Tensor) -> torch.Tensor:
+        """Convert a direction vector to a quaternion that rotates +X axis to that direction."""
+        # Normalize the vector
+        vec = vec / torch.norm(vec)
+        
+        # Default forward direction is +X
+        forward = torch.tensor([1.0, 0.0, 0.0], device=vec.device)
+        
+        # Calculate rotation axis (cross product)
+        axis = torch.cross(forward, vec)
+        axis_length = torch.norm(axis)
+        
+        # Handle the case where vectors are parallel
+        if axis_length < 1e-6:
+            if torch.dot(forward, vec) > 0:
+                # Same direction, no rotation needed
+                return torch.tensor([1.0, 0.0, 0.0, 0.0], device=vec.device)
+            else:
+                # Opposite direction, rotate 180 degrees around Y or Z
+                return torch.tensor([0.0, 0.0, 1.0, 0.0], device=vec.device)
+        
+        # Normalize axis
+        axis = axis / axis_length
+        
+        # Calculate angle
+        angle = torch.acos(torch.clamp(torch.dot(forward, vec), -1.0, 1.0))
+        
+        # Convert to quaternion using angle-axis representation
+        half_angle = angle / 2.0
+        w = torch.cos(half_angle)
+        xyz = axis * torch.sin(half_angle)
+        
+        return torch.cat([w.unsqueeze(0), xyz])
+
+    def step(self, action: torch.Tensor) -> VecEnvStepReturn:
+        """Override step to include external disturbances."""
+        # Store action
+        action = action.to(self.device)
+        if hasattr(self.cfg, "action_noise_model") and self.cfg.action_noise_model:
+            action = self._action_noise_model.apply(action)
+        
+        self._pre_physics_step(action)
+        
+        # Increment global step counter
+        self.global_env_steps_counter += 1
+        
+        is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
+        
+        # Perform physics stepping for the configured number of decimation steps
+        for _ in range(self.cfg.decimation):
+            if hasattr(self, "_sim_step_counter"):
+                self._sim_step_counter += 1
+            self._apply_action()
+            
+            # Apply external disturbances before writing to sim
+            self._apply_external_disturbances()
+            
+            self.scene.write_data_to_sim()
+            self.sim.step(render=False)
+            if hasattr(self, "_sim_step_counter") and self._sim_step_counter % self.cfg.sim.render_interval == 0 and is_rendering:
+                self.sim.render()
+            self.scene.update(dt=self.physics_dt)
+        
+        # Update force visualization
+        self._visualize_forces()
+        
+        # Continue with rest of step logic
+        self._compute_intermediate_values()
+        
+        # Update episode counters
+        self.episode_length_buf += 1
+        if hasattr(self, "common_step_counter"):
+            self.common_step_counter += 1
+        
+        # Get rewards and dones
+        self.reset_terminated[:], self.reset_time_outs[:] = self._get_dones()
+        self.reset_buf = self.reset_terminated | self.reset_time_outs
+        self.reward_buf = self._get_rewards()
+        
+        # Reset environments that have finished
+        reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+        if len(reset_env_ids) > 0:
+            self._reset_idx(reset_env_ids)
+            self.scene.write_data_to_sim()
+            if hasattr(self.sim, "forward"):
+                self.sim.forward()
+            if hasattr(self.sim, "has_rtx_sensors") and self.sim.has_rtx_sensors() and hasattr(self.cfg, "rerender_on_reset") and self.cfg.rerender_on_reset:
+                self.sim.render()
+        
+        # Apply interval-based events if configured
+        if hasattr(self.cfg, "events") and self.cfg.events:
+            if "interval" in self.event_manager.available_modes:
+                self.event_manager.apply(mode="interval", dt=self.step_dt)
+        
+        # Get final observations for the agent
+        self.obs_buf = self._get_observations()
+        
+        # Apply observation noise if configured
+        if hasattr(self.cfg, "observation_noise_model") and self.cfg.observation_noise_model:
+            self.obs_buf["policy"] = self._observation_noise_model.apply(self.obs_buf["policy"])
+        
+        return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
 
     def _compute_intermediate_values(self, env_ids: torch.Tensor | None = None):
         """
