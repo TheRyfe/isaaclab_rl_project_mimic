@@ -554,7 +554,7 @@ class AIRECEnv(DirectRLEnv):
                         self.current_animation_step[indices_to_advance] += 1
 
                 # Update ghost robot visualization
-                if self.cfg.enable_ghost_visualizer and hasattr(self, "ghost_robot") and self.ghost_robot is not None:
+                if self.cfg.enable_ghost_visualizer and hasattr(self, "ghost_robot") and self.ghost_robot is not None and self.sim.has_gui():
                     indices_to_use_for_ghost = None
                     if hasattr(self, "ghost_mimic_joint_indices") and self.ghost_mimic_joint_indices is not None:
                         indices_to_use_for_ghost = self.ghost_mimic_joint_indices

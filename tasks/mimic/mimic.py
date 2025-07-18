@@ -474,14 +474,16 @@ class MimicEnv(AIRECEnv):
         super()._setup_scene()
         print("DEBUG: MimicEnv._setup_scene - After super()._setup_scene()")
 
-        # Spawn the ghost robot if enabled in the configuration
-        if self.cfg.enable_ghost_visualizer:
+        # Spawn the ghost robot if enabled in the configuration and GUI is available
+        if self.cfg.enable_ghost_visualizer and self.sim.has_gui():
             self.ghost_robot = Articulation(self.cfg.ghost_robot_cfg)
             self.scene.articulations["ghost_robot"] = self.ghost_robot
             print("[INFO] Ghost visualizer robot added to the scene.")
+        elif self.cfg.enable_ghost_visualizer and not self.sim.has_gui():
+            print("[INFO] Ghost visualizer disabled in headless mode for performance.")
             
-        # Initialize force visualization markers if enabled
-        if self.cfg.external_disturbance.enable_disturbances and self.cfg.external_disturbance.enable_force_visualization:
+        # Initialize force visualization markers if enabled and GUI is available
+        if self.cfg.external_disturbance.enable_disturbances and self.cfg.external_disturbance.enable_force_visualization and self.sim.has_gui():
             try:
                 # Create arrow marker configuration with configurable parameters
                 base_arrow_scale = (
@@ -526,7 +528,10 @@ class MimicEnv(AIRECEnv):
                     self.force_visualization_markers = None
         else:
             self.force_visualization_markers = None
-            print("[INFO] Force visualization disabled in config")
+            if self.cfg.external_disturbance.enable_disturbances and self.cfg.external_disturbance.enable_force_visualization and not self.sim.has_gui():
+                print("[INFO] Force visualization disabled in headless mode for performance.")
+            else:
+                print("[INFO] Force visualization disabled in config")
             
         print("DEBUG: MimicEnv._setup_scene - END")
 
@@ -618,9 +623,14 @@ class MimicEnv(AIRECEnv):
                 
                 # Clear any active forces on reset
                 try:
-                    # Clear all forces for the reset environments
-                    zero_forces = torch.zeros((self.num_envs, len(self.robot.body_names), 3), device=self.device)
-                    zero_torques = torch.zeros((self.num_envs, len(self.robot.body_names), 3), device=self.device)
+                    # Create force/torque tensors only for environments being reset
+                    if isinstance(env_ids, torch.Tensor):
+                        num_reset_envs = len(env_ids)
+                    else:
+                        num_reset_envs = self.num_envs
+                    
+                    zero_forces = torch.zeros((num_reset_envs, len(self.robot.body_names), 3), device=self.device)
+                    zero_torques = torch.zeros((num_reset_envs, len(self.robot.body_names), 3), device=self.device)
                     
                     self.robot.set_external_force_and_torque(
                         forces=zero_forces,
@@ -854,7 +864,7 @@ class MimicEnv(AIRECEnv):
 
     def _visualize_forces(self):
         """Visualize the external forces using arrow markers."""
-        if self.force_visualization_markers is None:
+        if self.force_visualization_markers is None or not self.sim.has_gui():
             return
             
         # Find which environments have active forces
