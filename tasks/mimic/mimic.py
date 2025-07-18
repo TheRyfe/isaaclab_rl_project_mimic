@@ -186,12 +186,12 @@ class MimicEnvCfg(AIRECEnvCfg):
                 stabilization_threshold=0.0,
             ),
             activate_contact_sensors=False,
-            # To set the ghost's opacity and color, uncomment the following lines.
-            # This requires importing PreviewSurfaceCfg from the correct module.
-            # visual_material=PreviewSurfaceCfg(
-            #     opacity=0.4,
-            #     diffuse_color=(0.3, 0.3, 0.8)
-            # )
+            # Set the ghost robot's color
+            visual_material=PreviewSurfaceCfg(
+                diffuse_color=(0.8, 0.3, 0.3),  # Red color
+                roughness=0.4,
+                metallic=0.1
+            )
         )
     )
 
@@ -477,6 +477,9 @@ class MimicEnv(AIRECEnv):
             self.ghost_robot = Articulation(self.cfg.ghost_robot_cfg)
             self.scene.articulations["ghost_robot"] = self.ghost_robot
             print("[INFO] Ghost visualizer robot added to the scene.")
+            
+            # Hide base-related visuals for the ghost robot
+            self._hide_ghost_base_visuals()
         elif self.cfg.enable_ghost_visualizer and not self.sim.has_gui():
             print("[INFO] Ghost visualizer disabled in headless mode for performance.")
             
@@ -946,6 +949,86 @@ class MimicEnv(AIRECEnv):
             print(f"[ERROR] Force visualization failed: {e}")
             import traceback
             traceback.print_exc()
+    
+    def _hide_ghost_base_visuals(self):
+        """Hide the base-related visual meshes for the ghost robot."""
+        try:
+            from pxr import UsdGeom, Usd
+            
+            # Specific base-related prim names to hide (exact matches)
+            base_exact_names = {
+                "base_link",
+                "base_footprint", 
+                "base_front_left_wheel_link",
+                "base_front_right_wheel_link",
+                "base_rear_left_wheel_link",
+                "base_rear_right_wheel_link",
+                "base_link_tip",
+                "root",
+                "root_2",
+                "base_link_trans_x",
+                "base_link_trans_y",
+                "base_link_rot_yaw",
+                "torso_link_0"
+            }
+            
+            # Get the stage
+            stage = self.sim.stage
+            
+            # For each environment
+            for env_idx in range(self.num_envs):
+                ghost_prim_path = f"/World/envs/env_{env_idx}/GhostKinematicRobot"
+                
+                # First, try to traverse all prims under the ghost robot to find base-related ones
+                ghost_prim = stage.GetPrimAtPath(ghost_prim_path)
+                if ghost_prim.IsValid():
+                    # Traverse all descendants
+                    for prim in Usd.PrimRange(ghost_prim):
+                        prim_name = prim.GetName()
+                        prim_path = str(prim.GetPath())
+                        
+                        # Check if this prim is exactly one of our base components
+                        # or if it contains wheel/base_link but NOT hand_base_link
+                        should_hide = False
+                        
+                        # Exact match check
+                        if prim_name in base_exact_names:
+                            should_hide = True
+                        # Check for wheel links
+                        elif "wheel" in prim_name.lower():
+                            should_hide = True
+                        # Check for base links but exclude hand_base_link
+                        elif "base" in prim_name.lower() and "hand" not in prim_path.lower():
+                            # Additional check: only hide if it's really a base component
+                            if any(x in prim_name.lower() for x in ["base_link", "base_foot", "root"]):
+                                should_hide = True
+                        
+                        if should_hide:
+                            # Try to hide the prim and all its visual children
+                            self._hide_prim_and_visuals(prim)
+                            print(f"[DEBUG] Hiding prim: {prim.GetPath()}")
+            
+            print("[INFO] Hidden base visuals for ghost robot")
+            
+        except Exception as e:
+            print(f"[WARNING] Could not hide ghost base visuals: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _hide_prim_and_visuals(self, prim):
+        """Hide a prim and all its visual representations."""
+        from pxr import UsdGeom, Usd
+        
+        # Make the prim itself invisible
+        imageable = UsdGeom.Imageable(prim)
+        if imageable:
+            imageable.MakeInvisible()
+        
+        # Hide all child prims that might contain visuals
+        for child in Usd.PrimRange(prim):
+            child_imageable = UsdGeom.Imageable(child)
+            if child_imageable:
+                child_imageable.MakeInvisible()
     
     def _vector_to_quaternion(self, vec: torch.Tensor) -> torch.Tensor:
         """Convert a direction vector to a quaternion that rotates +X axis to that direction."""
