@@ -70,14 +70,15 @@ agent:
 # Trainer configuration
 trainer:
   num_eval_envs: 16
-  max_global_timesteps_M: 100
+  max_global_timesteps_M: 10
 
 # Logging and checkpoint configuration
 experiment:
   directory: "simon-gormuzov-waseda-university"
   experiment_name: "prop_mimic"
   save_checkpoints: 1
-  upload_videos: 0 #1 for videos
+  upload_videos: 1 #1 for videos
+  video_upload_interval: 1  # Upload videos to wandb every N evaluation episodes (set to 0 to only upload during checkpoints)
   debug: 0
   tb_log: True
   wandb: 1

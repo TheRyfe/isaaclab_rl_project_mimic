@@ -3,8 +3,6 @@
 # =============================================================================
 # - change visuals for arrow and make ghost transparent
 # - try to add collision detection reset
-# - make sure the ghost and visualiser do not run in headless mode
-# - add video training saver to the mimic
 # - clean code and formatting
 # =============================================================================
 # Imports
