@@ -1,7 +1,15 @@
+# Training and evaluation outputs
 logs/
 outputs/
 wandb/
 videos/
+recordings/
+checkpoints/
+
+# Temporary files
+todo.md
+tmp/
+temp/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

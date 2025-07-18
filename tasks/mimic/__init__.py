@@ -18,7 +18,7 @@ gym.register(
     id="Mimic",
     entry_point="tasks.mimic.mimic:MimicEnv",  # Corrected entry point
     kwargs={
-        "env_cfg_entry_point": mimic.MimicEnvCfg,
+        "env_cfg_entry_point": MimicEnvCfg,
         "skrl_cfg_entry_point": agent_cfg_path,
     },
     disable_env_checker=True,
