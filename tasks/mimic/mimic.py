@@ -1,8 +1,6 @@
 # =============================================================================
 # To Do List
 # =============================================================================
-# - change visuals for arrow and make ghost transparent
-# - try to add collision detection reset
 # - clean code and formatting
 # =============================================================================
 # Imports
