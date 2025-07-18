@@ -40,17 +40,19 @@ def make_env(env_cfg, writer, args_cli, obs_stack=1):
     #env.unwrapped.set_spaces(single_obs_space, obs_space, single_action_space, action_space)
     env.obs_stack = obs_stack
 
-    # wrap for video recording
-    if args_cli.video:
+    # wrap for video recording - only during evaluation to prevent memory leaks
+    if args_cli.video and env_cfg.num_eval_envs > 0:
+        # Only record videos for evaluation environments to prevent memory accumulation
         video_kwargs = {
             "video_folder": writer.video_dir,
             "step_trigger": lambda step: step % args_cli.video_interval == 0,
-            # "step_trigger": lambda step: step == 0,
             "video_length": args_cli.video_length,
             "disable_logger": True,
         }
-        print("[INFO] Recording videos during training.")
+        print(f"[INFO] Recording videos during training (eval envs only: {env_cfg.num_eval_envs}).")
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
+    elif args_cli.video:
+        print("[INFO] Video recording disabled - no evaluation environments configured.")
     
     # FrameStack expects a gym env
     if obs_stack > 1:

@@ -501,6 +501,7 @@ class MimicEnv(AIRECEnv):
         # Parent scene setup complete
 
         # Spawn the ghost robot if enabled in the configuration and GUI is available
+        # Automatically disable ghost robot in headless mode to save memory
         if self.cfg.enable_ghost_visualizer and self.sim.has_gui():
             self.ghost_robot = Articulation(self.cfg.ghost_robot_cfg)
             self.scene.articulations["ghost_robot"] = self.ghost_robot
@@ -509,9 +510,12 @@ class MimicEnv(AIRECEnv):
             # Hide base-related visuals for the ghost robot
             self._hide_ghost_base_visuals()
         elif self.cfg.enable_ghost_visualizer and not self.sim.has_gui():
-            print("[INFO] Ghost visualizer disabled in headless mode for performance.")
+            print("[INFO] Ghost visualizer automatically disabled in headless mode for performance.")
+            # Disable ghost robot to save memory
+            self.cfg.enable_ghost_visualizer = False
 
         # Initialize force visualization markers if enabled and GUI is available
+        # Automatically disable force visualization in headless mode to save memory
         if (
             self.cfg.external_disturbance.enable_disturbances
             and self.cfg.external_disturbance.enable_force_visualization
@@ -566,7 +570,9 @@ class MimicEnv(AIRECEnv):
                 and self.cfg.external_disturbance.enable_force_visualization
                 and not self.sim.has_gui()
             ):
-                print("[INFO] Force visualization disabled in headless mode for performance.")
+                print("[INFO] Force visualization automatically disabled in headless mode for performance.")
+                # Disable force visualization to save memory
+                self.cfg.external_disturbance.enable_force_visualization = False
             else:
                 print("[INFO] Force visualization disabled in config")
 
