@@ -1,12 +1,11 @@
 # =============================================================================
 # To Do List
 # =============================================================================
-# - Change animation to walk in circle
-# - Use old model with the base for training
-# - Tweak the reward function, network and reset logic
-# - Fix wrist bug
-# - Add randomized external forces
-# - Make ghost only applicable to the test envs only
+# - change visuals for arrow and make ghost transparent
+# - try to add collision detection reset
+# - make sure the ghost and visualiser do not run in headless mode
+# - add video training saver to the mimic
+# - clean code and formatting
 # =============================================================================
 # Imports
 # =============================================================================
@@ -85,11 +84,11 @@ class RewardsCfg:
 class TerminationCfg:
     """Configuration for episode termination conditions."""
     # Joint limit termination
-    enable_joint_limit_termination: bool = False
+    enable_joint_limit_termination: bool = True
     joint_limit_buffer: float = 0.95  # Terminate at 95% of soft limits
     
     # Torso tilt termination
-    enable_torso_tilt_termination: bool = False
+    enable_torso_tilt_termination: bool = True
     torso_tilt_limit: float = 0.785  # 45 degrees in radians
     torso_joints_to_check: list[str] = field(default_factory=lambda: ["torso_joint_1", "torso_joint_2"])
 
