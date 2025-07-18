@@ -68,16 +68,16 @@ class RewardsCfg:
     
     # Orientation rewards
     orientation_reward_scale: float = 0.5
-    orientation_error_threshold: float = 0.44  # ~25 degrees in radians
+    orientation_error_threshold: float = 0.30  # in radians
     
     # Penalties
-    current_joint_vel_penalty_scale: float = -0.0001
+    current_joint_vel_penalty_scale: float = -0.001
     action_smoothness_penalty_scale: float = -0.01
     joint_acceleration_penalty_scale: float = -0.01
     energy_penalty_scale: float = -0.001
     
     # Other rewards
-    staying_alive_reward: float = 0.002
+    staying_alive_reward: float = 0.005
 
 
 @configclass
@@ -89,7 +89,7 @@ class TerminationCfg:
     
     # Torso tilt termination
     enable_torso_tilt_termination: bool = True
-    torso_tilt_limit: float = 0.785  # 45 degrees in radians
+    torso_tilt_limit: float = 0.4  #in radians
     torso_joints_to_check: list[str] = field(default_factory=lambda: ["torso_joint_1", "torso_joint_2"])
 
 
@@ -102,13 +102,13 @@ class ExternalDisturbanceCfg:
     target_body_name: str = "right_arm_link_5"
     
     # Force parameters (in Newtons, applied in global/world coordinate frame)
-    force_magnitude_range: tuple[float, float] = (500.0, 2000.0)
+    force_magnitude_range: tuple[float, float] = (300.0, 850.0)
     
     # Duration parameters (in seconds)
-    duration_range: tuple[float, float] = (0.5, 1.5)  # Shorter duration for more frequent changes
+    duration_range: tuple[float, float] = (0.5, 2.5)  # Shorter duration for more frequent changes
     
     # Interval between disturbances (in seconds)
-    interval_range: tuple[float, float] = (0.5, 2.0)  # Shorter cooldown
+    interval_range: tuple[float, float] = (0.5, 3.0)  # Shorter cooldown
     
     # Probability of applying disturbance per environment per step
     disturbance_probability: float = 0.01  # 1% chance per step per env
@@ -119,7 +119,7 @@ class ExternalDisturbanceCfg:
     # Directional bias parameters (for simulating leaning)
     # Bias values are normalized direction weights (will be normalized to unit vector)
     directional_bias: tuple[float, float, float] = (0.0, 0.0, -1.0)  # Default: downward bias
-    bias_strength: float = 0.6  # 0.0 = pure random, 1.0 = pure bias direction
+    bias_strength: float = 0.4  # 0.0 = pure random, 1.0 = pure bias direction
     
     # Visualization parameters
     enable_force_visualization: bool = True
