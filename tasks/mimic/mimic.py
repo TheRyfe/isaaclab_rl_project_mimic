@@ -77,11 +77,11 @@ class TerminationCfg:
     """Configuration for episode termination conditions."""
 
     # Joint limit termination
-    enable_joint_limit_termination: bool = True
+    enable_joint_limit_termination: bool = False
     joint_limit_buffer: float = 0.95  # Terminate at 95% of soft limits
 
     # Torso tilt termination
-    enable_torso_tilt_termination: bool = True
+    enable_torso_tilt_termination: bool = False
     torso_tilt_limit: float = 0.4  # in radians
     torso_joints_to_check: list[str] = field(default_factory=lambda: ["torso_joint_1", "torso_joint_2"])
 
@@ -117,6 +117,7 @@ class ExternalDisturbanceCfg:
 
     # Visualization parameters
     enable_force_visualization: bool = True
+    force_enable_force_viz_in_headless: bool = False  # Force enable force visualization even in headless mode
     force_arrow_scale: float = 1.0  # Scale factor: arrow length = force magnitude * scale
 
     # Arrow shape parameters
@@ -182,6 +183,7 @@ class MimicEnvCfg(AIRECEnvCfg):
 
     # -- Ghost Visualizer Configuration
     enable_ghost_visualizer: bool = True
+    force_enable_ghost_in_headless: bool = False  # Force enable ghost visualizer even in headless mode
     ghost_robot_cfg: ArticulationCfg = DEFAULT_KINEMATIC_GHOST_CFG.replace(
         spawn=DEFAULT_KINEMATIC_GHOST_CFG.spawn.replace(
             # Set kinematic properties for the ghost to save performance.
@@ -500,26 +502,26 @@ class MimicEnv(AIRECEnv):
         super()._setup_scene()
         # Parent scene setup complete
 
-        # Spawn the ghost robot if enabled in the configuration and GUI is available
-        # Automatically disable ghost robot in headless mode to save memory
-        if self.cfg.enable_ghost_visualizer and self.sim.has_gui():
+        # Spawn the ghost robot if enabled in the configuration and GUI is available (or force enabled in headless)
+        # Automatically disable ghost robot in headless mode to save memory unless force enabled
+        if self.cfg.enable_ghost_visualizer and (self.sim.has_gui() or self.cfg.force_enable_ghost_in_headless):
             self.ghost_robot = Articulation(self.cfg.ghost_robot_cfg)
             self.scene.articulations["ghost_robot"] = self.ghost_robot
             print("[INFO] Ghost visualizer robot added to the scene.")
 
             # Hide base-related visuals for the ghost robot
             self._hide_ghost_base_visuals()
-        elif self.cfg.enable_ghost_visualizer and not self.sim.has_gui():
+        elif self.cfg.enable_ghost_visualizer and not self.sim.has_gui() and not self.cfg.force_enable_ghost_in_headless:
             print("[INFO] Ghost visualizer automatically disabled in headless mode for performance.")
             # Disable ghost robot to save memory
             self.cfg.enable_ghost_visualizer = False
 
-        # Initialize force visualization markers if enabled and GUI is available
-        # Automatically disable force visualization in headless mode to save memory
+        # Initialize force visualization markers if enabled and GUI is available (or force enabled in headless)
+        # Automatically disable force visualization in headless mode to save memory unless force enabled
         if (
             self.cfg.external_disturbance.enable_disturbances
             and self.cfg.external_disturbance.enable_force_visualization
-            and self.sim.has_gui()
+            and (self.sim.has_gui() or self.cfg.external_disturbance.force_enable_force_viz_in_headless)
         ):
             try:
                 # Create arrow marker configuration with configurable parameters
@@ -569,6 +571,7 @@ class MimicEnv(AIRECEnv):
                 self.cfg.external_disturbance.enable_disturbances
                 and self.cfg.external_disturbance.enable_force_visualization
                 and not self.sim.has_gui()
+                and not self.cfg.external_disturbance.force_enable_force_viz_in_headless
             ):
                 print("[INFO] Force visualization automatically disabled in headless mode for performance.")
                 # Disable force visualization to save memory

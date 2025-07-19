@@ -81,6 +81,14 @@ def main(env_cfg, agent_cfg: dict):
     agent_cfg["log_path"] = LOG_PATH
     args_cli.video = agent_cfg["experiment"]["upload_videos"]
 
+    # Override video_length from agent config if available
+    if "experiment" in agent_cfg and "video_length" in agent_cfg["experiment"]:
+        args_cli.video_length = agent_cfg["experiment"]["video_length"]
+
+    # Override renderer from agent config if available
+    if "experiment" in agent_cfg and "renderer" in agent_cfg["experiment"]:
+        args_cli.renderer = agent_cfg["experiment"]["renderer"]
+
     # Update the environment config
     env_cfg = update_env_cfg(args_cli, env_cfg, agent_cfg)
 

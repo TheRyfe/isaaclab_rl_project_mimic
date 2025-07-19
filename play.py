@@ -82,6 +82,10 @@ def main(env_cfg, agent_cfg: dict):
     set_seed(agent_cfg["seed"])
     agent_cfg["log_path"] = LOG_PATH
 
+    # Override video_length from agent config if available
+    if "experiment" in agent_cfg and "video_length" in agent_cfg["experiment"]:
+        args_cli.video_length = agent_cfg["experiment"]["video_length"]
+
     # Update the environment config
     env_cfg = update_env_cfg(args_cli, env_cfg, agent_cfg)
 
