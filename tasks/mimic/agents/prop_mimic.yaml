@@ -1,5 +1,8 @@
 seed: 42
 
+# Episode configuration
+episode_length_s: 18.0  # Fixed episode length in seconds
+
 # Models are instantiated using skrl's model instantiator utility
 # https://skrl.readthedocs.io/en/latest/api/utils/model_instantiators.html
 models:
@@ -52,7 +55,7 @@ agent:
 
   discount_factor: 0.99
   lambda: 0.95
-  learning_rate: 0.0003
+  learning_rate: 0.00001
   value_preprocessor: RunningStandardScaler
   value_preprocessor_kwargs: null
 
@@ -77,7 +80,7 @@ experiment:
   directory: "simon-gormuzov-waseda-university"
   experiment_name: "prop_mimic"
   save_checkpoints: 1
-  upload_videos: 1 #1 for videos
+  upload_videos: 0 #1 for videos
   video_upload_interval: 1  # Upload videos to wandb every N evaluation episodes (set to 0 to only upload during checkpoints)
   video_length: 1000  # Length of videos in timesteps
   debug: 0

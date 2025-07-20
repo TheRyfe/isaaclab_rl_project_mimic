@@ -146,7 +146,6 @@ class MimicEnvCfg(AIRECEnvCfg):
     # -- Task-specific parameters
     animation_file: str = "assets/animation/walkingsupport.csv"
     animation_dt_info: float = 1.0 / 60.0
-    dynamic_episode_length_buffer_s: float = 2.0
 
     # -- Robot control parameters
     num_base_actions: int = 0
@@ -258,20 +257,8 @@ class MimicEnv(AIRECEnv):
         self._mimic_env_determined_max_animation_steps = self.max_animation_steps
         # Animation steps determined for episode length calculation
 
-        # Dynamically adjust episode length to ensure the full animation can be played
+        # Use the fixed episode length from configuration (no dynamic adjustment)
         required_episode_length_s = cfg.episode_length_s
-        if self._mimic_env_determined_max_animation_steps > 0 and provisional_control_dt > 0:
-            calculated_animation_duration_s = self._mimic_env_determined_max_animation_steps * provisional_control_dt
-            required_episode_length_s_for_anim = calculated_animation_duration_s + cfg.dynamic_episode_length_buffer_s
-            if required_episode_length_s_for_anim > required_episode_length_s:
-                print(
-                    f"[MimicEnv __init__ PRE-SUPER] INFO: Original cfg.episode_length_s: {cfg.episode_length_s:.2f}s."
-                )
-                print(
-                    f"[MimicEnv __init__ PRE-SUPER] INFO: Animation requires {self._mimic_env_determined_max_animation_steps} control steps ({calculated_animation_duration_s:.2f}s). "
-                    f"With buffer, desired episode length is {required_episode_length_s_for_anim:.2f}s."
-                )
-                required_episode_length_s = required_episode_length_s_for_anim
 
         # -- Prepare configuration for the parent AIRECEnv
         modified_parent_cfg = copy.deepcopy(cfg)
@@ -345,14 +332,7 @@ class MimicEnv(AIRECEnv):
         self._load_animation_data()
         # print(f"DEBUG: Animation loaded - steps: {self.max_animation_steps}, data exists: {hasattr(self, 'animation_pos_data')}")
 
-        # Final check on episode length vs animation length
-        if hasattr(self, "max_animation_steps") and self.max_animation_steps > 0 and self.control_dt > 0:
-            required_total_control_steps_for_animation = self.max_animation_steps
-            if self.max_episode_length < required_total_control_steps_for_animation:
-                print(
-                    f"[MimicEnv __init__] POST-SUPER CRITICAL WARNING: Final max_episode_length ({self.max_episode_length}) "
-                    f"is STILL SHORTER than animation steps ({required_total_control_steps_for_animation})."
-                )
+        # Animation can loop or continue beyond its original length - no length check needed
 
         # Create joint index mappings for the main controllable robot
         try:
@@ -1206,14 +1186,8 @@ class MimicEnv(AIRECEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Determines if episodes have terminated or been truncated."""
-        # Termination condition: The animation sequence has completed (natural end)
-        if self.max_animation_steps <= 0:
-            terminated = torch.ones_like(self.current_animation_step, dtype=torch.bool, device=self.device)
-            if not hasattr(self, "_no_anim_data_critical_warned_dones"):
-                print("[MimicEnv _get_dones] CRITICAL: max_animation_steps <= 0. Forcing animation_completed=True.")
-                self._no_anim_data_critical_warned_dones = True
-        else:
-            terminated = self.current_animation_step >= (self.max_animation_steps - 1)
+        # No animation-based termination - episodes only end due to time limit or other conditions
+        terminated = torch.zeros_like(self.current_animation_step, dtype=torch.bool, device=self.device)
 
         # Joint limit termination
         if self.cfg.termination.enable_joint_limit_termination:
