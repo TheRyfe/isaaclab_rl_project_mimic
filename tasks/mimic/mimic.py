@@ -49,6 +49,7 @@ class RewardsCfg:
     joint_pos_tracking_reward_scale: float = 4.0
     pos_error_variance_scale: float = 0.25
     use_weighted_pos_tracking: bool = True
+    pos_tracking_power_scale: float = 2.0  # Power scaling to emphasize accuracy (>1 for super-linear)
     # Joint importance weights for different body parts
     head_joint_weight: float = 0.5
     torso_joint_weight: float = 2.0
@@ -104,8 +105,9 @@ class ExternalDisturbanceCfg:
     # Interval between disturbances (in seconds)
     interval_range: tuple[float, float] = (0.5, 3.0)  # Shorter cooldown
 
-    # Probability of applying disturbance per environment per step
-    disturbance_probability: float = 0.01  # 1% chance per step per env
+    # Probability of applying disturbance per environment per standard timestep (1/60s)
+    # This probability is automatically scaled for different control frequencies
+    disturbance_probability: float = 0.01  # 1% chance per standard timestep per env
 
     # Episode start timeout (in seconds) - no forces applied during this period
     episode_start_timeout: float = 4.0
@@ -146,6 +148,7 @@ class MimicEnvCfg(AIRECEnvCfg):
     # -- Task-specific parameters
     animation_file: str = "assets/animation/walkingsupport.csv"
     animation_dt_info: float = 1.0 / 60.0
+    auto_episode_length_buffer: float = 2.0  # Buffer time (seconds) added to animation duration
 
     # -- Robot control parameters
     num_base_actions: int = 0
@@ -257,8 +260,20 @@ class MimicEnv(AIRECEnv):
         self._mimic_env_determined_max_animation_steps = self.max_animation_steps
         # Animation steps determined for episode length calculation
 
-        # Use the fixed episode length from configuration (no dynamic adjustment)
-        required_episode_length_s = cfg.episode_length_s
+        # Calculate episode length based on animation data and control frequency
+        # The episode should last as long as the full animation sequence
+        if self.max_animation_steps > 0:
+            # Each animation step corresponds to animation_dt_info seconds
+            animation_duration_s = self.max_animation_steps * cfg.animation_dt_info
+            # Add some buffer time to allow the robot to reach the final pose
+            buffer_time_s = cfg.auto_episode_length_buffer
+            required_episode_length_s = animation_duration_s + buffer_time_s
+            print(f"[INFO] Auto-calculated episode length: {required_episode_length_s:.1f}s "
+                  f"(animation: {animation_duration_s:.1f}s + buffer: {buffer_time_s:.1f}s)")
+        else:
+            # Fallback to configured value if no animation data
+            required_episode_length_s = cfg.episode_length_s
+            print(f"[INFO] Using configured episode length: {required_episode_length_s:.1f}s (no animation data)")
 
         # -- Prepare configuration for the parent AIRECEnv
         modified_parent_cfg = copy.deepcopy(cfg)
@@ -463,14 +478,23 @@ class MimicEnv(AIRECEnv):
         self.disturbance_remaining_time = torch.zeros(self.num_envs, device=self.device)
         self.disturbance_cooldown_time = torch.zeros(self.num_envs, device=self.device)
         self.episode_start_time = torch.zeros(self.num_envs, device=self.device)
+        self.simulation_time = torch.zeros(self.num_envs, device=self.device)  # Track actual simulation time
 
         if self.cfg.external_disturbance.enable_disturbances:
             print(f"[INFO] External disturbance system initialized:")
             print(f"  - Force range: {self.cfg.external_disturbance.force_magnitude_range} N")
             print(f"  - Duration range: {self.cfg.external_disturbance.duration_range} s")
             print(f"  - Interval range: {self.cfg.external_disturbance.interval_range} s")
-            print(f"  - Probability: {self.cfg.external_disturbance.disturbance_probability}")
+            print(f"  - Probability: {self.cfg.external_disturbance.disturbance_probability} (per standard timestep)")
+            print(f"  - Episode start timeout: {self.cfg.external_disturbance.episode_start_timeout} s")
+            print(f"  - Control dt: {self.control_dt:.4f} s (used for timing)")
             print(f"  - Visualization: {self.cfg.external_disturbance.enable_force_visualization}")
+            
+            # Validate configuration
+            if self.cfg.external_disturbance.duration_range[0] > self.cfg.external_disturbance.duration_range[1]:
+                print("[WARNING] Invalid duration_range: min > max")
+            if self.cfg.external_disturbance.interval_range[0] > self.cfg.external_disturbance.interval_range[1]:
+                print("[WARNING] Invalid interval_range: min > max")
         if hasattr(self, "animation_pos_data") and self.max_animation_steps <= 0:
             print("[WARNING] Animation data appears empty after full loading. Mimicry may not function.")
         # MimicEnv initialization complete
@@ -642,6 +666,7 @@ class MimicEnv(AIRECEnv):
                 self.disturbance_remaining_time[env_ids] = 0.0
                 self.disturbance_cooldown_time[env_ids] = 0.0
                 self.episode_start_time[env_ids] = 0.0
+                self.simulation_time[env_ids] = 0.0
 
                 # Clear any active forces on reset
                 try:
@@ -727,6 +752,7 @@ class MimicEnv(AIRECEnv):
                 self.previous_actions,
                 self.cfg.rewards,
                 self.num_mimic_joints,
+                target_velocities=None,  # No velocity data in animation currently
             )
         )
 
@@ -774,9 +800,10 @@ class MimicEnv(AIRECEnv):
         if not hasattr(self, "disturbance_body_id") or self.disturbance_body_id is None:
             return
 
+        # Use control_dt for time updates since this is called once per environment step
         dt = self.control_dt
 
-        # Update timers
+        # Update timers based on actual time passage
         self.disturbance_remaining_time = torch.clamp(self.disturbance_remaining_time - dt, min=0.0)
         self.disturbance_cooldown_time = torch.clamp(self.disturbance_cooldown_time - dt, min=0.0)
         self.episode_start_time = self.episode_start_time + dt
@@ -787,9 +814,18 @@ class MimicEnv(AIRECEnv):
         # Find environments that can receive new disturbances
         can_disturb = (self.disturbance_remaining_time == 0) & (self.disturbance_cooldown_time == 0) & (~in_timeout)
 
+        # Adjust probability based on actual timestep duration
+        # The configured probability is per "standard step" (assumed to be 1/60 Hz = 0.0167s)
+        # Scale it by the ratio of control_dt to this standard
+        standard_dt = 1.0 / 60.0  # Standard animation timestep
+        time_scale_factor = self.control_dt / standard_dt
+        adjusted_probability = self.cfg.external_disturbance.disturbance_probability * time_scale_factor
+        adjusted_probability = min(adjusted_probability, 1.0)  # Cap at 100%
+        
+        
         # Randomly select which environments to disturb
         disturb_mask = can_disturb & (
-            torch.rand(self.num_envs, device=self.device) < self.cfg.external_disturbance.disturbance_probability
+            torch.rand(self.num_envs, device=self.device) < adjusted_probability
         )
 
         if disturb_mask.any():
@@ -840,9 +876,10 @@ class MimicEnv(AIRECEnv):
             )
 
             # Set durations for new disturbances
-            self.disturbance_remaining_time[disturb_mask] = sample_uniform(
+            new_durations = sample_uniform(
                 cfg.duration_range[0], cfg.duration_range[1], (num_disturbed,), device=self.device
             )
+            self.disturbance_remaining_time[disturb_mask] = new_durations
 
             # Set cooldown for next disturbance
             self.disturbance_cooldown_time[disturb_mask] = sample_uniform(
@@ -1071,7 +1108,7 @@ class MimicEnv(AIRECEnv):
         forward = torch.tensor([1.0, 0.0, 0.0], device=vec.device)
 
         # Calculate rotation axis (cross product)
-        axis = torch.cross(forward, vec)
+        axis = torch.cross(forward, vec, dim=0)
         axis_length = torch.norm(axis)
 
         # Handle the case where vectors are parallel
@@ -1107,6 +1144,10 @@ class MimicEnv(AIRECEnv):
 
         # Increment global step counter
         self.global_env_steps_counter += 1
+        
+        # Update simulation time for active environments (not reset ones)
+        active_envs = ~self.reset_buf
+        self.simulation_time[active_envs] += self.control_dt
 
         is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
 
@@ -1246,6 +1287,7 @@ def compute_mimic_rewards_simplified(
     previous_actions: torch.Tensor,
     rewards_cfg: RewardsCfg,
     num_tracked_joints: int,
+    target_velocities: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Calculates the different components of the mimicry reward.
@@ -1274,25 +1316,52 @@ def compute_mimic_rewards_simplified(
     if num_tracked_joints == 0:
         pos_tracking_reward = torch.zeros(batch_size, device=device)
         current_joint_vel_penalty = torch.zeros(batch_size, device=device)
+        vel_tracking_reward = torch.zeros(batch_size, device=device)
     else:
         # Position tracking reward based on squared error (exponentially shaped)
-        pos_error_sq_sum = torch.sum(torch.square(target_positions - current_positions), dim=-1)
+        if rewards_cfg.use_weighted_pos_tracking:
+            # Apply joint-specific weights (assuming standard joint order: head, torso, arms)
+            # This is a simplified weighting - would need proper joint mapping for full implementation
+            weights = torch.ones(num_tracked_joints, device=device)
+            # For now, apply uniform weighting since joint mapping is complex
+            pos_error_sq = torch.square(target_positions - current_positions)
+            pos_error_sq_sum = torch.sum(pos_error_sq, dim=-1)
+        else:
+            pos_error_sq_sum = torch.sum(torch.square(target_positions - current_positions), dim=-1)
+            
         pos_variance_term = rewards_cfg.pos_error_variance_scale * float(num_tracked_joints)
         pos_variance_term = max(pos_variance_term, 1e-6)  # avoid division by zero
-        pos_tracking_reward = (
-            torch.exp(-pos_error_sq_sum / pos_variance_term) * rewards_cfg.joint_pos_tracking_reward_scale
-        )
+        
+        # Calculate base exponential reward
+        base_reward = torch.exp(-pos_error_sq_sum / pos_variance_term)
+        
+        # Apply power scaling to increase sensitivity near perfect tracking
+        power_scale = rewards_cfg.pos_tracking_power_scale
+        scaled_reward = torch.pow(base_reward, power_scale)
+        
+        pos_tracking_reward = scaled_reward * rewards_cfg.joint_pos_tracking_reward_scale
+        
         # Velocity penalty to discourage excessive speed
         current_vel_sq_sum = torch.sum(torch.square(current_velocities), dim=-1)
         current_joint_vel_penalty = current_vel_sq_sum * rewards_cfg.current_joint_vel_penalty_scale
+        
+        # Velocity tracking reward (if target velocities are provided)
+        if target_velocities is not None:
+            vel_error_sq_sum = torch.sum(torch.square(target_velocities - current_velocities), dim=-1)
+            vel_variance_term = rewards_cfg.vel_error_variance_scale * float(num_tracked_joints)
+            vel_variance_term = max(vel_variance_term, 1e-6)
+            vel_tracking_reward = torch.exp(-vel_error_sq_sum / vel_variance_term) * rewards_cfg.joint_vel_tracking_reward_scale
+        else:
+            vel_tracking_reward = torch.zeros(batch_size, device=device)
 
     # -- Action smoothness penalty to discourage jerky movements
     action_diff_sq_sum = torch.sum(torch.square(actions - previous_actions), dim=-1)
     action_smoothness_penalty = action_diff_sq_sum * rewards_cfg.action_smoothness_penalty_scale
 
+
     # -- Total reward is the sum of all components
     total_rewards = (
-        pos_tracking_reward + staying_alive_rew_component + current_joint_vel_penalty + action_smoothness_penalty
+        pos_tracking_reward + vel_tracking_reward + staying_alive_rew_component + current_joint_vel_penalty + action_smoothness_penalty
     )
 
     return (

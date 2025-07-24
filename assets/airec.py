@@ -12,7 +12,7 @@ from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 from isaaclab.utils.assets import ISAACLAB_NUCLEUS_DIR
 
-VEL_SCALE =  0.1
+VEL_SCALE =  0.5
 
 AIREC_CFG = ArticulationCfg(
     ###########################################################################

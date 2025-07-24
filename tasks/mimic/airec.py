@@ -65,8 +65,8 @@ class AIRECEnvCfg(DirectRLEnvCfg):
 
     # -- Physics and Simulation settings
     physics_dt = 1 / 120
-    decimation = 12
-    render_interval = 2
+    decimation = 2
+    render_interval = 1
     episode_length_s = 30.0 
 
     # -- RL settings
@@ -127,7 +127,7 @@ class AIRECEnvCfg(DirectRLEnvCfg):
     num_gt_observations: int = 0
     num_states = 0
     num_prop_joints = 20
-    num_prop_observations = num_prop_joints * 2 + num_actions + 7 * 2
+    num_prop_observations = num_prop_joints * 2 + num_actions + 7 * 2  # [joint pos, joint vel, actions, ee pose * 2]
     num_observations = 0
     action_space = num_actions
     observation_space = num_observations
@@ -172,6 +172,10 @@ class AIRECEnvCfg(DirectRLEnvCfg):
     num_cameras = 1
     object_type = "rigid"
     img_dim = 84
+
+    # -- Action smoothing
+    act_moving_average = 0.01
+    vel_max_magnitude = 3.0  # Legacy parameter, kept for compatibility
 
 
 # =============================================================================
@@ -231,10 +235,32 @@ class AIRECEnv(DirectRLEnv):
             )
             self.prop_joint_indices = torch.arange(num_total_robot_joints, device=self.device, dtype=torch.long)
 
+        # -- Get velocity limits from robot data
+        self.soft_vel_limits = self.robot.data.soft_joint_vel_limits[0, :].to(device=self.device)
+        self.hard_vel_limits = self.robot.data.joint_vel_limits[0, :].to(device=self.device)
+        
+        print("[INFO] Soft velocity limits:", self.soft_vel_limits[self.actuated_dof_indices])
+        print("[INFO] Hard velocity limits:", self.hard_vel_limits[self.actuated_dof_indices])
+
         # -- Initialize runtime tensors
         self.actions = torch.zeros((self.num_envs, self.cfg.num_actions), device=self.device)
+        self.last_action = torch.zeros((self.num_envs, self.cfg.num_actions), device=self.device)
         self.joint_pos = torch.zeros((self.num_envs, len(self.prop_joint_indices)), device=self.device)
         self.joint_vel = torch.zeros((self.num_envs, len(self.prop_joint_indices)), device=self.device)
+        
+        # Normalized states
+        self.normalised_joint_pos = torch.zeros((self.num_envs, len(self.prop_joint_indices)), device=self.device)
+        self.normalised_joint_vel = torch.zeros((self.num_envs, len(self.prop_joint_indices)), device=self.device)
+        
+        # Action targets for smoothing
+        num_actuated = len(self.actuated_dof_indices)
+        self.cur_targets = torch.zeros((self.num_envs, num_actuated), device=self.device)
+        self.prev_targets = torch.zeros((self.num_envs, num_actuated), device=self.device)
+        
+        # Initialize targets to default positions
+        default_joint_pos = self.robot.data.default_joint_pos[:, self.actuated_dof_indices]
+        self.cur_targets[:] = default_joint_pos
+        self.prev_targets[:] = default_joint_pos
 
         self.target_base_pos = torch.zeros((self.num_envs, 7), device=self.device)
         self.target_base_vel = torch.zeros((self.num_envs, 7), device=self.device)
@@ -396,6 +422,9 @@ class AIRECEnv(DirectRLEnv):
 
     def _apply_action(self) -> None:
         """Applies the agent's actions to the robot."""
+        # Store last action for observations
+        self.last_action = self.cur_targets.clone()
+        
         base_actions_raw = self.actions[:, : self.cfg.num_base_actions]
         robot_joint_actions_raw = self.actions[:, self.cfg.num_base_actions :]
 
@@ -404,8 +433,25 @@ class AIRECEnv(DirectRLEnv):
                 pass  # Mismatch warning could be added here if necessary
 
             if self.cfg.control_mode == "position":
+                # Scale actions to joint limits
                 scaled_position_targets = self.scale_action(robot_joint_actions_raw)
-                self.robot.set_joint_position_target(scaled_position_targets, joint_ids=self.actuated_dof_indices)
+                
+                # Apply moving average smoothing
+                self.cur_targets = (
+                    self.cfg.act_moving_average * scaled_position_targets
+                    + (1.0 - self.cfg.act_moving_average) * self.prev_targets
+                )
+                
+                # Saturate to ensure within limits
+                lower_limits_actuated = self.robot_dof_lower_limits[self.actuated_dof_indices]
+                upper_limits_actuated = self.robot_dof_upper_limits[self.actuated_dof_indices]
+                self.cur_targets = saturate(self.cur_targets, lower_limits_actuated, upper_limits_actuated)
+                
+                # Update previous targets
+                self.prev_targets = self.cur_targets.clone()
+                
+                # Apply the smoothed targets
+                self.robot.set_joint_position_target(self.cur_targets, joint_ids=self.actuated_dof_indices)
             elif self.cfg.control_mode == "velocity":
                 self.robot.set_joint_velocity_target(robot_joint_actions_raw, joint_ids=self.actuated_dof_indices)
             else:
@@ -462,13 +508,13 @@ class AIRECEnv(DirectRLEnv):
         """Constructs the proprioceptive observation vector."""
         prop = torch.cat(
             (
-                self.joint_pos,
-                self.joint_vel,
+                self.normalised_joint_pos,
+                self.normalised_joint_vel,
+                self.actions,  # Use actions instead of cur_targets/prev_targets for backward compatibility
                 self.lhand_pos,
                 self.lhand_rot,
                 self.rhand_pos,
                 self.rhand_rot,
-                self.actions,
             ),
             dim=-1,
         )
@@ -501,6 +547,11 @@ class AIRECEnv(DirectRLEnv):
         joint_vel = torch.zeros_like(joint_pos)
         self.robot.set_joint_position_target(joint_pos, joint_ids=None, env_ids=env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+        
+        # Reset action targets to default positions
+        default_actuated_pos = joint_pos[:, self.actuated_dof_indices]
+        self.cur_targets[env_ids] = default_actuated_pos
+        self.prev_targets[env_ids] = default_actuated_pos
 
         # Reset root state (base position and orientation)
         robot_default_state = self.robot.data.default_root_state[env_ids].clone()
@@ -527,6 +578,20 @@ class AIRECEnv(DirectRLEnv):
 
         self.joint_pos[_env_ids_to_use] = full_joint_pos[:, self.prop_joint_indices]
         self.joint_vel[_env_ids_to_use] = full_joint_vel[:, self.prop_joint_indices]
+
+        # Calculate normalized joint positions using unscale
+        self.normalised_joint_pos[_env_ids_to_use] = unscale(
+            self.joint_pos[_env_ids_to_use], 
+            self.robot_dof_lower_limits[self.prop_joint_indices], 
+            self.robot_dof_upper_limits[self.prop_joint_indices]
+        )
+        
+        # Calculate normalized joint velocities using hardware limits
+        self.normalised_joint_vel[_env_ids_to_use] = unscale(
+            self.joint_vel[_env_ids_to_use], 
+            -self.hard_vel_limits[self.prop_joint_indices], 
+            self.hard_vel_limits[self.prop_joint_indices]
+        )
 
         self.lhand_pos[_env_ids_to_use] = self.lhand_frame.data.target_pos_source[..., 0, :][_env_ids_to_use]
         self.lhand_rot[_env_ids_to_use] = self.lhand_frame.data.target_quat_source[..., 0, :][_env_ids_to_use]
