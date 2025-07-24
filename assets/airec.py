@@ -12,6 +12,8 @@ from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 from isaaclab.utils.assets import ISAACLAB_NUCLEUS_DIR
 
+VEL_SCALE =  0.1
+
 AIREC_CFG = ArticulationCfg(
     ###########################################################################
     # Where and how to load the AIREC USD
@@ -25,7 +27,7 @@ AIREC_CFG = ArticulationCfg(
             enabled_self_collisions=False,
             fix_root_link=True,  # Fix the root link to prevent it from moving
             solver_position_iteration_count=8,
-            solver_velocity_iteration_count=8,
+            solver_velocity_iteration_count=4,
             sleep_threshold=0.00001,
             stabilization_threshold=0.00001,
         ),
@@ -57,8 +59,19 @@ AIREC_CFG = ArticulationCfg(
                 "torso_joint_2",
                 "torso_joint_3",
             ],
-            stiffness=10000.0,
-            damping=1000.0,
+            stiffness={"torso_joint_1": 3000.0,
+                       "torso_joint_2": 1000.0,
+                       "torso_joint_3": 500.0,
+                    },
+            damping={"torso_joint_1": 150.0,
+                    "torso_joint_2": 100.0,
+                    "torso_joint_3": 50.0
+                    },
+            velocity_limit_sim={
+                "torso_joint_1": 0.872 * VEL_SCALE,
+                "torso_joint_2": 1.571 * VEL_SCALE,
+                "torso_joint_3": 1.571 * VEL_SCALE
+            },
         ),
 
         # ---------------------------------------------------------------------
@@ -73,12 +86,12 @@ AIREC_CFG = ArticulationCfg(
                 "head_joint_2",
                 "head_joint_3",
             ],
-            stiffness=100.0,
-            damping=10.0,
-            velocity_limit={
-                "head_joint_1": 320.0,
-                "head_joint_2": 180.0,
-                "head_joint_3": 100.0,
+            stiffness={".*": 1000.0},
+            damping={".*": 100.0},
+            velocity_limit_sim={
+                "head_joint_1": 5.585 * VEL_SCALE,
+                "head_joint_2": 4.712 * VEL_SCALE,
+                "head_joint_3": 3.839 * VEL_SCALE
             },
             effort_limit={
                 "head_joint_1": 8.0,
@@ -100,16 +113,30 @@ AIREC_CFG = ArticulationCfg(
                 "left_arm_joint_6",
                 "left_arm_joint_7",
             ],
-            stiffness=10000.0,
-            damping=1000.0,
-            velocity_limit={
-                "left_arm_joint_1": 150.0,
-                "left_arm_joint_2": 150.0,
-                "left_arm_joint_3": 120.0,
-                "left_arm_joint_4": 190.0,
-                "left_arm_joint_5": 210.0,
-                "left_arm_joint_6": 210.0,
-                "left_arm_joint_7": 210.0,
+            stiffness={"left_arm_joint_1": 300,
+                    "left_arm_joint_2": 300,
+                    "left_arm_joint_3": 200,
+                    "left_arm_joint_4": 200,
+                    "left_arm_joint_5": 20,
+                    "left_arm_joint_6": 20,
+                    "left_arm_joint_7": 20,
+                    },
+            damping={"left_arm_joint_1": 30,
+                    "left_arm_joint_2": 30,
+                    "left_arm_joint_3": 20,
+                    "left_arm_joint_4": 20,
+                    "left_arm_joint_5": 1,
+                    "left_arm_joint_6": 1,
+                    "left_arm_joint_7": 1
+            },
+            velocity_limit_sim={
+                "left_arm_joint_1": 2.617 * VEL_SCALE,
+                "left_arm_joint_2": 2.617 * VEL_SCALE,
+                "left_arm_joint_3": 3.316 * VEL_SCALE,
+                "left_arm_joint_4": 3.316 * VEL_SCALE,
+                "left_arm_joint_5": 4.014 * VEL_SCALE,
+                "left_arm_joint_6": 4.014 * VEL_SCALE,
+                "left_arm_joint_7": 4.014 * VEL_SCALE
             },
             effort_limit={
                 "left_arm_joint_1": 70.0,
@@ -135,16 +162,30 @@ AIREC_CFG = ArticulationCfg(
                 "right_arm_joint_6",
                 "right_arm_joint_7",
             ],
-            stiffness=10000.0,
-            damping=1000.0,
-            velocity_limit={
-                "right_arm_joint_1": 150.0,
-                "right_arm_joint_2": 150.0,
-                "right_arm_joint_3": 120.0,
-                "right_arm_joint_4": 190.0,
-                "right_arm_joint_5": 210.0,
-                "right_arm_joint_6": 210.0,
-                "right_arm_joint_7": 210.0,
+            stiffness={"right_arm_joint_1": 300,
+                    "right_arm_joint_2": 300,
+                    "right_arm_joint_3": 200,
+                    "right_arm_joint_4": 200,
+                    "right_arm_joint_5": 20,
+                    "right_arm_joint_6": 20,
+                    "right_arm_joint_7": 20,
+                    },
+            damping={"right_arm_joint_1": 30,
+                    "right_arm_joint_2": 30,
+                    "right_arm_joint_3": 20,
+                    "right_arm_joint_4": 20,
+                    "right_arm_joint_5": 1,
+                    "right_arm_joint_6": 1,
+                    "right_arm_joint_7": 1
+            },
+            velocity_limit_sim={
+                "right_arm_joint_1": 2.617 * VEL_SCALE,
+                "right_arm_joint_2": 2.617 * VEL_SCALE,
+                "right_arm_joint_3": 3.316 * VEL_SCALE,
+                "right_arm_joint_4": 3.316 * VEL_SCALE,
+                "right_arm_joint_5": 4.014 * VEL_SCALE,
+                "right_arm_joint_6": 4.014 * VEL_SCALE,
+                "right_arm_joint_7": 4.014 * VEL_SCALE
             },
             effort_limit={
                 "right_arm_joint_1": 70.0,
@@ -172,8 +213,8 @@ AIREC_CFG = ArticulationCfg(
                 "left_hand_third_finger_joint_2",
                 "left_hand_thumb_joint_4",
             ],
-            stiffness=0.3,
-            damping=3.0,
+            stiffness={".*": 3.0},
+            damping={".*": 0.3},
             velocity_limit=75.0,  # ~1.309
             effort_limit=1.0,                 # Nm
         ),
@@ -193,8 +234,8 @@ AIREC_CFG = ArticulationCfg(
                 "right_hand_third_finger_joint_2",
                 "right_hand_thumb_joint_4",
             ],
-            stiffness=0.3,
-            damping=3.0,
+            stiffness={".*": 3.0},
+            damping={".*": 0.3},
             velocity_limit=75.0,  # ~1.309
             effort_limit=1.0,                 # Nm
         ),

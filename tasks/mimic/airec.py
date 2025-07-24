@@ -65,9 +65,9 @@ class AIRECEnvCfg(DirectRLEnvCfg):
 
     # -- Physics and Simulation settings
     physics_dt = 1 / 120
-    decimation = 2
+    decimation = 12
     render_interval = 2
-    episode_length_s = 5.0
+    episode_length_s = 30.0 
 
     # -- RL settings
     obs_stack = 1
@@ -126,7 +126,7 @@ class AIRECEnvCfg(DirectRLEnvCfg):
     obs_list = ["prop"]
     num_gt_observations: int = 0
     num_states = 0
-    num_prop_joints = 40
+    num_prop_joints = 20
     num_prop_observations = num_prop_joints * 2 + num_actions + 7 * 2
     num_observations = 0
     action_space = num_actions

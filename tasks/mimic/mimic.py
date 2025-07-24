@@ -1110,14 +1110,14 @@ class MimicEnv(AIRECEnv):
 
         is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
 
+        # Apply external disturbances once per environment step (before physics loop)
+        self._apply_external_disturbances()
+
         # Perform physics stepping for the configured number of decimation steps
         for _ in range(self.cfg.decimation):
             if hasattr(self, "_sim_step_counter"):
                 self._sim_step_counter += 1
             self._apply_action()
-
-            # Apply external disturbances before writing to sim
-            self._apply_external_disturbances()
 
             self.scene.write_data_to_sim()
             self.sim.step(render=False)
