@@ -46,10 +46,11 @@ class RewardsCfg:
     """Configuration for reward components and scales for the mimicry task."""
 
     # Position tracking rewards
-    joint_pos_tracking_reward_scale: float = 4.0
+    joint_pos_tracking_reward_scale: float = 3.0  # Reduced from 4.0
     pos_error_variance_scale: float = 0.25
     use_weighted_pos_tracking: bool = True
     pos_tracking_power_scale: float = 2.0  # Power scaling to emphasize accuracy (>1 for super-linear)
+    normalize_joint_errors: bool = True  # Normalize joint errors to [-1, 1] range based on joint limits
     # Joint importance weights for different body parts
     head_joint_weight: float = 0.5
     torso_joint_weight: float = 2.0
@@ -71,6 +72,13 @@ class RewardsCfg:
 
     # Other rewards
     staying_alive_reward: float = 0.005
+    
+    # Link tracking rewards for specific body parts
+    link_tracking_names: list[str] = field(default_factory=lambda: ["right_arm_link_5", "left_arm_link_5"])
+    link_pos_tracking_scale: float = 4.0  # Increased from 2.0
+    link_ori_tracking_scale: float = 2.0  # Increased from 1.0
+    link_pos_error_variance: float = 0.1
+    link_ori_error_variance: float = 0.2
 
 
 @configclass
@@ -398,6 +406,25 @@ class MimicEnv(AIRECEnv):
             )
             self.ghost_mimic_joint_indices = None
 
+        # Setup position limits for mimicked joints (for normalization)
+        if self.robot.data.soft_joint_pos_limits is not None and self.robot.data.soft_joint_pos_limits.numel() > 0:
+            self.mimic_joint_pos_limits = self.robot.data.soft_joint_pos_limits[0, self.mimic_joint_indices_in_robot, :].clone()
+            self.mimic_joint_pos_lower = self.mimic_joint_pos_limits[:, 0]
+            self.mimic_joint_pos_upper = self.mimic_joint_pos_limits[:, 1]
+            self.mimic_joint_pos_range = self.mimic_joint_pos_upper - self.mimic_joint_pos_lower
+            # Check for zero ranges
+            zero_range_mask = torch.isclose(self.mimic_joint_pos_range, torch.tensor(0.0, device=self.device))
+            if torch.any(zero_range_mask):
+                print(f"[WARNING] Some joints have zero position range, setting to default [-pi, pi]")
+                self.mimic_joint_pos_range[zero_range_mask] = 2 * math.pi
+                self.mimic_joint_pos_lower[zero_range_mask] = -math.pi
+                self.mimic_joint_pos_upper[zero_range_mask] = math.pi
+        else:
+            print("[WARNING] No joint position limits found, using default [-pi, pi] for all joints")
+            self.mimic_joint_pos_lower = torch.full((self.num_mimic_joints,), -math.pi, device=self.device)
+            self.mimic_joint_pos_upper = torch.full((self.num_mimic_joints,), math.pi, device=self.device)
+            self.mimic_joint_pos_range = torch.full((self.num_mimic_joints,), 2 * math.pi, device=self.device)
+        
         # Setup velocity limits for mimicked joints
         if self.robot.data.joint_vel_limits is None or self.robot.data.joint_vel_limits.numel() == 0:
             print(
@@ -433,6 +460,7 @@ class MimicEnv(AIRECEnv):
             "mimic_staying_alive_reward": torch.zeros(self.num_envs, device=self.device),
             "mimic_current_vel_penalty": torch.zeros(self.num_envs, device=self.device),
             "mimic_action_smoothness_penalty": torch.zeros(self.num_envs, device=self.device),
+            "mimic_link_tracking_reward": torch.zeros(self.num_envs, device=self.device),
             "mimic_total_reward": torch.zeros(self.num_envs, device=self.device),
             "current_animation_frame": torch.zeros(self.num_envs, device=self.device, dtype=torch.float32),
             "joint_limit_violations": torch.zeros(self.num_envs, device=self.device, dtype=torch.float32),
@@ -497,6 +525,27 @@ class MimicEnv(AIRECEnv):
                 print("[WARNING] Invalid interval_range: min > max")
         if hasattr(self, "animation_pos_data") and self.max_animation_steps <= 0:
             print("[WARNING] Animation data appears empty after full loading. Mimicry may not function.")
+        
+        # -- Initialize link tracking for reward computation
+        self.tracking_link_ids = []
+        self.tracking_link_names = []
+        if self.cfg.rewards.link_tracking_names:
+            for link_name in self.cfg.rewards.link_tracking_names:
+                body_ids, body_names = self.robot.find_bodies(link_name)
+                if body_ids:
+                    self.tracking_link_ids.append(body_ids[0])
+                    self.tracking_link_names.append(body_names[0])
+                    print(f"[INFO] Link tracking enabled for: {body_names[0]} (body_id: {body_ids[0]})")
+                else:
+                    print(f"[WARNING] Could not find link '{link_name}' for tracking reward")
+            
+            if self.tracking_link_ids:
+                self.tracking_link_ids = torch.tensor(self.tracking_link_ids, device=self.device, dtype=torch.long)
+                print(f"[INFO] Tracking {len(self.tracking_link_ids)} links for pose matching reward")
+            else:
+                print("[WARNING] No valid links found for tracking reward")
+                self.tracking_link_ids = None
+        
         # MimicEnv initialization complete
 
     def _setup_scene(self):
@@ -742,8 +791,25 @@ class MimicEnv(AIRECEnv):
             safe_anim_indices = torch.clamp(self.current_animation_step, 0, self.max_animation_steps - 1)
             target_animation_joint_pos = self.animation_pos_data[safe_anim_indices, :]
 
+        # Get body states for link tracking reward if configured
+        real_link_pos = None
+        real_link_ori = None
+        ghost_link_pos = None
+        ghost_link_ori = None
+        
+        if hasattr(self, 'tracking_link_ids') and self.tracking_link_ids is not None and self.ghost_robot is not None:
+            # Get real robot link states
+            real_body_states = self.robot.data.body_state_w[:, self.tracking_link_ids, :]
+            real_link_pos = real_body_states[:, :, :3]  # shape: (num_envs, num_links, 3)
+            real_link_ori = real_body_states[:, :, 3:7]  # shape: (num_envs, num_links, 4)
+            
+            # Get ghost robot link states
+            ghost_body_states = self.ghost_robot.data.body_state_w[:, self.tracking_link_ids, :]
+            ghost_link_pos = ghost_body_states[:, :, :3]
+            ghost_link_ori = ghost_body_states[:, :, 3:7]
+        
         # Compute reward components by calling the reward function
-        total_reward, pos_track_rew, staying_alive_rew, current_vel_pen, action_smooth_pen = (
+        total_reward, pos_track_rew, staying_alive_rew, current_vel_pen, action_smooth_pen, link_track_rew = (
             compute_mimic_rewards_simplified(
                 current_mimic_joints_pos,
                 target_animation_joint_pos,
@@ -753,6 +819,12 @@ class MimicEnv(AIRECEnv):
                 self.cfg.rewards,
                 self.num_mimic_joints,
                 target_velocities=None,  # No velocity data in animation currently
+                real_link_pos=real_link_pos,
+                real_link_ori=real_link_ori,
+                ghost_link_pos=ghost_link_pos,
+                ghost_link_ori=ghost_link_ori,
+                joint_pos_lower=self.mimic_joint_pos_lower,
+                joint_pos_upper=self.mimic_joint_pos_upper,
             )
         )
 
@@ -765,6 +837,7 @@ class MimicEnv(AIRECEnv):
         log["mimic_staying_alive_reward"] = staying_alive_rew
         log["mimic_current_vel_penalty"] = current_vel_pen
         log["mimic_action_smoothness_penalty"] = action_smooth_pen
+        log["mimic_link_tracking_reward"] = link_track_rew
         log["mimic_total_reward"] = total_reward
         log["current_animation_frame"] = self.current_animation_step.float()
 
@@ -1288,7 +1361,13 @@ def compute_mimic_rewards_simplified(
     rewards_cfg: RewardsCfg,
     num_tracked_joints: int,
     target_velocities: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    real_link_pos: torch.Tensor | None = None,
+    real_link_ori: torch.Tensor | None = None,
+    ghost_link_pos: torch.Tensor | None = None,
+    ghost_link_ori: torch.Tensor | None = None,
+    joint_pos_lower: torch.Tensor | None = None,
+    joint_pos_upper: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Calculates the different components of the mimicry reward.
 
@@ -1300,9 +1379,17 @@ def compute_mimic_rewards_simplified(
         previous_actions: The actions taken in the previous step.
         rewards_cfg: The configuration object for reward scaling factors.
         num_tracked_joints: The number of joints being tracked for mimicry.
+        target_velocities: The target joint velocities (optional).
+        real_link_pos: Positions of tracked links on real robot (num_envs, num_links, 3).
+        real_link_ori: Orientations of tracked links on real robot (num_envs, num_links, 4).
+        ghost_link_pos: Positions of tracked links on ghost robot (num_envs, num_links, 3).
+        ghost_link_ori: Orientations of tracked links on ghost robot (num_envs, num_links, 4).
+        joint_pos_lower: Lower limits for joint positions (num_joints,).
+        joint_pos_upper: Upper limits for joint positions (num_joints,).
 
     Returns:
-        A tuple containing the total reward and its individual components.
+        A tuple containing the total reward and its individual components:
+        (total_reward, pos_tracking, staying_alive, vel_penalty, smoothness_penalty, link_tracking)
     """
     batch_size = current_positions.shape[0]
     device = current_positions.device
@@ -1318,18 +1405,43 @@ def compute_mimic_rewards_simplified(
         current_joint_vel_penalty = torch.zeros(batch_size, device=device)
         vel_tracking_reward = torch.zeros(batch_size, device=device)
     else:
+        # Normalize positions if requested and limits are provided
+        if rewards_cfg.normalize_joint_errors and joint_pos_lower is not None and joint_pos_upper is not None:
+            # Normalize positions to [-1, 1] range
+            joint_range = joint_pos_upper - joint_pos_lower
+            joint_mid = (joint_pos_upper + joint_pos_lower) / 2.0
+            
+            # Avoid division by zero
+            safe_range = torch.where(joint_range > 1e-6, joint_range, torch.ones_like(joint_range))
+            
+            # Normalize: (pos - mid) / (range/2) -> [-1, 1]
+            norm_current = (current_positions - joint_mid) / (safe_range / 2.0)
+            norm_target = (target_positions - joint_mid) / (safe_range / 2.0)
+            
+            # Calculate normalized error
+            pos_error = norm_target - norm_current
+        else:
+            # Use raw positions without normalization
+            pos_error = target_positions - current_positions
+        
         # Position tracking reward based on squared error (exponentially shaped)
         if rewards_cfg.use_weighted_pos_tracking:
             # Apply joint-specific weights (assuming standard joint order: head, torso, arms)
             # This is a simplified weighting - would need proper joint mapping for full implementation
             weights = torch.ones(num_tracked_joints, device=device)
             # For now, apply uniform weighting since joint mapping is complex
-            pos_error_sq = torch.square(target_positions - current_positions)
+            pos_error_sq = torch.square(pos_error)
             pos_error_sq_sum = torch.sum(pos_error_sq, dim=-1)
         else:
-            pos_error_sq_sum = torch.sum(torch.square(target_positions - current_positions), dim=-1)
+            pos_error_sq_sum = torch.sum(torch.square(pos_error), dim=-1)
             
-        pos_variance_term = rewards_cfg.pos_error_variance_scale * float(num_tracked_joints)
+        # Adjust variance based on whether we're using normalized errors
+        if rewards_cfg.normalize_joint_errors and joint_pos_lower is not None and joint_pos_upper is not None:
+            # For normalized errors in [-2, 2] range (worst case), adjust variance accordingly
+            pos_variance_term = rewards_cfg.pos_error_variance_scale * float(num_tracked_joints)
+        else:
+            # For raw radians, use the original variance
+            pos_variance_term = rewards_cfg.pos_error_variance_scale * float(num_tracked_joints)
         pos_variance_term = max(pos_variance_term, 1e-6)  # avoid division by zero
         
         # Calculate base exponential reward
@@ -1358,10 +1470,41 @@ def compute_mimic_rewards_simplified(
     action_diff_sq_sum = torch.sum(torch.square(actions - previous_actions), dim=-1)
     action_smoothness_penalty = action_diff_sq_sum * rewards_cfg.action_smoothness_penalty_scale
 
+    # -- Link tracking reward for specific body parts
+    link_tracking_reward = torch.zeros(batch_size, device=device)
+    if real_link_pos is not None and ghost_link_pos is not None:
+        # Position tracking for links
+        pos_errors = real_link_pos - ghost_link_pos  # (num_envs, num_links, 3)
+        pos_errors_sq = torch.sum(pos_errors ** 2, dim=-1)  # (num_envs, num_links)
+        pos_errors_sum = torch.sum(pos_errors_sq, dim=-1)  # (num_envs,)
+        
+        # Apply exponential shaping
+        pos_variance = rewards_cfg.link_pos_error_variance * pos_errors.shape[1]  # scale by num links
+        pos_variance = max(pos_variance, 1e-6)
+        link_pos_reward = torch.exp(-pos_errors_sum / pos_variance) * rewards_cfg.link_pos_tracking_scale
+        
+        # Orientation tracking for links
+        if real_link_ori is not None and ghost_link_ori is not None:
+            # Quaternion distance: 1 - |dot(q1, q2)|
+            # Note: quaternions are (w, x, y, z) format
+            quat_dots = torch.sum(real_link_ori * ghost_link_ori, dim=-1)  # (num_envs, num_links)
+            quat_dots = torch.abs(quat_dots)  # Handle double-cover property of quaternions
+            ori_errors = 1.0 - quat_dots  # (num_envs, num_links)
+            ori_errors_sum = torch.sum(ori_errors, dim=-1)  # (num_envs,)
+            
+            # Apply exponential shaping
+            ori_variance = rewards_cfg.link_ori_error_variance * ori_errors.shape[1]
+            ori_variance = max(ori_variance, 1e-6)
+            link_ori_reward = torch.exp(-ori_errors_sum / ori_variance) * rewards_cfg.link_ori_tracking_scale
+            
+            link_tracking_reward = link_pos_reward + link_ori_reward
+        else:
+            link_tracking_reward = link_pos_reward
 
     # -- Total reward is the sum of all components
     total_rewards = (
-        pos_tracking_reward + vel_tracking_reward + staying_alive_rew_component + current_joint_vel_penalty + action_smoothness_penalty
+        pos_tracking_reward + vel_tracking_reward + staying_alive_rew_component + 
+        current_joint_vel_penalty + action_smoothness_penalty + link_tracking_reward
     )
 
     return (
@@ -1370,4 +1513,5 @@ def compute_mimic_rewards_simplified(
         staying_alive_rew_component,
         current_joint_vel_penalty,
         action_smoothness_penalty,
+        link_tracking_reward,
     )
