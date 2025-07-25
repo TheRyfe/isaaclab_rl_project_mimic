@@ -117,8 +117,8 @@ class ExternalDisturbanceCfg:
     # This probability is automatically scaled for different control frequencies
     disturbance_probability: float = 0.01  # 1% chance per standard timestep per env
 
-    # Episode start timeout (in seconds) - no forces applied during this period
-    episode_start_timeout: float = 4.0
+    # Episode start grace period (in steps) - no forces applied during this period  
+    episode_start_grace_steps: int = 130
 
     # Directional bias parameters (for simulating leaning)
     # Bias values are normalized direction weights (will be normalized to unit vector)
@@ -157,6 +157,10 @@ class MimicEnvCfg(AIRECEnvCfg):
     animation_file: str = "assets/animation/walkingsupport.csv"
     animation_dt_info: float = 1.0 / 60.0
     auto_episode_length_buffer: float = 2.0  # Buffer time (seconds) added to animation duration
+    
+    # -- Episode length configuration
+    use_fixed_episode_length_steps: bool = True  # Use fixed step count instead of dynamic calculation
+    fixed_episode_length_steps: int = 900  # Fixed episode length in steps
 
     # -- Robot control parameters
     num_base_actions: int = 0
@@ -268,20 +272,28 @@ class MimicEnv(AIRECEnv):
         self._mimic_env_determined_max_animation_steps = self.max_animation_steps
         # Animation steps determined for episode length calculation
 
-        # Calculate episode length based on animation data and control frequency
-        # The episode should last as long as the full animation sequence
-        if self.max_animation_steps > 0:
-            # Each animation step corresponds to animation_dt_info seconds
-            animation_duration_s = self.max_animation_steps * cfg.animation_dt_info
-            # Add some buffer time to allow the robot to reach the final pose
-            buffer_time_s = cfg.auto_episode_length_buffer
-            required_episode_length_s = animation_duration_s + buffer_time_s
-            print(f"[INFO] Auto-calculated episode length: {required_episode_length_s:.1f}s "
-                  f"(animation: {animation_duration_s:.1f}s + buffer: {buffer_time_s:.1f}s)")
+        # Calculate episode length based on configuration
+        if cfg.use_fixed_episode_length_steps:
+            # Use fixed episode length in steps
+            # Convert steps to seconds: steps * control_dt
+            required_episode_length_s = cfg.fixed_episode_length_steps * provisional_control_dt
+            print(f"[INFO] Using fixed episode length: {cfg.fixed_episode_length_steps} steps "
+                  f"({required_episode_length_s:.1f}s at {provisional_control_dt:.4f}s per step)")
         else:
-            # Fallback to configured value if no animation data
-            required_episode_length_s = cfg.episode_length_s
-            print(f"[INFO] Using configured episode length: {required_episode_length_s:.1f}s (no animation data)")
+            # Use dynamic calculation based on animation data and control frequency
+            # The episode should last as long as the full animation sequence
+            if self.max_animation_steps > 0:
+                # Each animation step corresponds to animation_dt_info seconds
+                animation_duration_s = self.max_animation_steps * cfg.animation_dt_info
+                # Add some buffer time to allow the robot to reach the final pose
+                buffer_time_s = cfg.auto_episode_length_buffer
+                required_episode_length_s = animation_duration_s + buffer_time_s
+                print(f"[INFO] Auto-calculated episode length: {required_episode_length_s:.1f}s "
+                      f"(animation: {animation_duration_s:.1f}s + buffer: {buffer_time_s:.1f}s)")
+            else:
+                # Fallback to configured value if no animation data
+                required_episode_length_s = cfg.episode_length_s
+                print(f"[INFO] Using configured episode length: {required_episode_length_s:.1f}s (no animation data)")
 
         # -- Prepare configuration for the parent AIRECEnv
         modified_parent_cfg = copy.deepcopy(cfg)
@@ -505,7 +517,7 @@ class MimicEnv(AIRECEnv):
         self.disturbance_torques = torch.zeros((self.num_envs, 3), device=self.device)
         self.disturbance_remaining_time = torch.zeros(self.num_envs, device=self.device)
         self.disturbance_cooldown_time = torch.zeros(self.num_envs, device=self.device)
-        self.episode_start_time = torch.zeros(self.num_envs, device=self.device)
+        self.episode_step_counter = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)  # Track steps since episode start
         self.simulation_time = torch.zeros(self.num_envs, device=self.device)  # Track actual simulation time
 
         if self.cfg.external_disturbance.enable_disturbances:
@@ -514,7 +526,7 @@ class MimicEnv(AIRECEnv):
             print(f"  - Duration range: {self.cfg.external_disturbance.duration_range} s")
             print(f"  - Interval range: {self.cfg.external_disturbance.interval_range} s")
             print(f"  - Probability: {self.cfg.external_disturbance.disturbance_probability} (per standard timestep)")
-            print(f"  - Episode start timeout: {self.cfg.external_disturbance.episode_start_timeout} s")
+            print(f"  - Episode start grace period: {self.cfg.external_disturbance.episode_start_grace_steps} steps")
             print(f"  - Control dt: {self.control_dt:.4f} s (used for timing)")
             print(f"  - Visualization: {self.cfg.external_disturbance.enable_force_visualization}")
             
@@ -714,7 +726,7 @@ class MimicEnv(AIRECEnv):
                 self.disturbance_torques[env_ids] = 0.0
                 self.disturbance_remaining_time[env_ids] = 0.0
                 self.disturbance_cooldown_time[env_ids] = 0.0
-                self.episode_start_time[env_ids] = 0.0
+                self.episode_step_counter[env_ids] = 0
                 self.simulation_time[env_ids] = 0.0
 
                 # Clear any active forces on reset
@@ -879,13 +891,21 @@ class MimicEnv(AIRECEnv):
         # Update timers based on actual time passage
         self.disturbance_remaining_time = torch.clamp(self.disturbance_remaining_time - dt, min=0.0)
         self.disturbance_cooldown_time = torch.clamp(self.disturbance_cooldown_time - dt, min=0.0)
-        self.episode_start_time = self.episode_start_time + dt
+        
+        # Increment step counter for active environments (not reset ones)
+        # Note: We need to access reset_buf from the parent environment
+        if hasattr(self, 'reset_buf'):
+            active_envs = ~self.reset_buf
+            self.episode_step_counter[active_envs] += 1
+        else:
+            # Fallback: increment all environments if reset_buf not available
+            self.episode_step_counter += 1
 
-        # Check if we're still in the episode start timeout period
-        in_timeout = self.episode_start_time < self.cfg.external_disturbance.episode_start_timeout
+        # Check if we're still in the episode start grace period (step-based)
+        in_grace_period = self.episode_step_counter < self.cfg.external_disturbance.episode_start_grace_steps
 
         # Find environments that can receive new disturbances
-        can_disturb = (self.disturbance_remaining_time == 0) & (self.disturbance_cooldown_time == 0) & (~in_timeout)
+        can_disturb = (self.disturbance_remaining_time == 0) & (self.disturbance_cooldown_time == 0) & (~in_grace_period)
 
         # Adjust probability based on actual timestep duration
         # The configured probability is per "standard step" (assumed to be 1/60 Hz = 0.0167s)
