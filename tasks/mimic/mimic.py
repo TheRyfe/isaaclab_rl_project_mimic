@@ -24,6 +24,7 @@ from isaaclab.envs import VecEnvObs
 from isaaclab.envs.common import VecEnvStepReturn
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.markers.config import RED_ARROW_X_MARKER_CFG
+from isaaclab.sensors import Camera, CameraCfg
 from isaaclab.sim.schemas.schemas_cfg import (
     ArticulationRootPropertiesCfg,
     CollisionPropertiesCfg,
@@ -198,6 +199,7 @@ class MimicEnvCfg(AIRECEnvCfg):
     # -- Ghost Visualizer Configuration
     enable_ghost_visualizer: bool = True
     force_enable_ghost_in_headless: bool = False  # Force enable ghost visualizer even in headless mode
+    enable_headless_camera: bool = True  # Enable camera rendering in headless mode for visualization
     ghost_robot_cfg: ArticulationCfg = DEFAULT_KINEMATIC_GHOST_CFG.replace(
         spawn=DEFAULT_KINEMATIC_GHOST_CFG.spawn.replace(
             # Set kinematic properties for the ghost to save performance.
@@ -217,6 +219,22 @@ class MimicEnvCfg(AIRECEnvCfg):
             # Set the ghost robot's color
             visual_material=PreviewSurfaceCfg(diffuse_color=(0.8, 0.3, 0.3), roughness=0.4, metallic=0.1),  # Red color
         )
+    )
+    
+    # -- Camera Configuration for headless visualization
+    camera_cfg: CameraCfg = CameraCfg(
+        prim_path="/World/envs/env_.*/Camera",
+        update_period=0.1,  # Update at 10 Hz
+        height=480,
+        width=640,
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=24.0,
+            focus_distance=400.0,
+            horizontal_aperture=20.955,
+            clipping_range=(0.1, 10000.0),
+        ),
+        offset=CameraCfg.OffsetCfg(pos=(2.5, 2.5, 2.5), rot=(0.7071, 0.0, 0.7071, 0.0)),  # Isometric view
     )
 
 
@@ -569,24 +587,23 @@ class MimicEnv(AIRECEnv):
 
         # Spawn the ghost robot if enabled in the configuration and GUI is available (or force enabled in headless)
         # Automatically disable ghost robot in headless mode to save memory unless force enabled
-        if self.cfg.enable_ghost_visualizer and (self.sim.has_gui() or self.cfg.force_enable_ghost_in_headless):
+        if self.cfg.enable_ghost_visualizer and self.sim.has_gui():
             self.ghost_robot = Articulation(self.cfg.ghost_robot_cfg)
             self.scene.articulations["ghost_robot"] = self.ghost_robot
             print("[INFO] Ghost visualizer robot added to the scene.")
 
             # Hide base-related visuals for the ghost robot
             self._hide_ghost_base_visuals()
-        elif self.cfg.enable_ghost_visualizer and not self.sim.has_gui() and not self.cfg.force_enable_ghost_in_headless:
-            print("[INFO] Ghost visualizer automatically disabled in headless mode for performance.")
+        else:
+            print("[INFO] Ghost visualizer disabled in headless mode for performance.")
             # Disable ghost robot to save memory
             self.cfg.enable_ghost_visualizer = False
 
-        # Initialize force visualization markers if enabled and GUI is available (or force enabled in headless)
-        # Automatically disable force visualization in headless mode to save memory unless force enabled
+        # Initialize force visualization markers if enabled and GUI is available
         if (
             self.cfg.external_disturbance.enable_disturbances
             and self.cfg.external_disturbance.enable_force_visualization
-            and (self.sim.has_gui() or self.cfg.external_disturbance.force_enable_force_viz_in_headless)
+            and self.sim.has_gui()
         ):
             try:
                 # Create arrow marker configuration with configurable parameters
@@ -632,17 +649,7 @@ class MimicEnv(AIRECEnv):
                     self.force_visualization_markers = None
         else:
             self.force_visualization_markers = None
-            if (
-                self.cfg.external_disturbance.enable_disturbances
-                and self.cfg.external_disturbance.enable_force_visualization
-                and not self.sim.has_gui()
-                and not self.cfg.external_disturbance.force_enable_force_viz_in_headless
-            ):
-                print("[INFO] Force visualization automatically disabled in headless mode for performance.")
-                # Disable force visualization to save memory
-                self.cfg.external_disturbance.enable_force_visualization = False
-            else:
-                print("[INFO] Force visualization disabled in config")
+            print("[INFO] Force visualization disabled in headless mode")
 
         # Scene setup complete
 

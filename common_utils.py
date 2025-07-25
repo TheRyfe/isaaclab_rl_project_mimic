@@ -13,6 +13,7 @@ from isaaclab_rl.models.encoder import Encoder
 from isaaclab_rl.models.running_standard_scaler import RunningStandardScaler
 from isaaclab_rl.wrappers.frame_stack import FrameStack
 from isaaclab_rl.wrappers.isaaclab_wrapper import IsaacLabWrapper
+from isaaclab_rl.wrappers.video_recorder import VideoRecorder
 
 # ADD YOUR ENVS HERE
 from tasks import mimic 
@@ -43,14 +44,21 @@ def make_env(env_cfg, writer, args_cli, obs_stack=1):
     # wrap for video recording - only during evaluation to prevent memory leaks
     if args_cli.video and env_cfg.num_eval_envs > 0:
         # Only record videos for evaluation environments to prevent memory accumulation
-        video_kwargs = {
-            "video_folder": writer.video_dir,
-            "step_trigger": lambda step: step % args_cli.video_interval == 0,
-            "video_length": args_cli.video_length,
-            "disable_logger": True,
-        }
-        print(f"[INFO] Recording videos during training (eval envs only: {env_cfg.num_eval_envs}).")
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
+        # Create list of evaluation environment indices
+        eval_env_indices = list(range(env_cfg.num_eval_envs))
+        
+        print(f"[INFO] Recording videos during training (eval envs: {eval_env_indices}).")
+        env = VideoRecorder(
+            env=env,
+            video_folder=writer.video_dir,
+            step_trigger=lambda step: step % args_cli.video_interval == 0,
+            video_length=args_cli.video_length,
+            name_prefix="isaac_lab_mimic",
+            video_fps=30,
+            eval_env_indices=eval_env_indices,
+        )
+        # Store writer reference in env for later access
+        env.writer = writer
     elif args_cli.video:
         print("[INFO] Video recording disabled - no evaluation environments configured.")
     
@@ -112,6 +120,8 @@ def make_trainer(env, agent, agent_cfg, auxiliary_task=None, writer=None):
 
     num_timesteps_M = agent_cfg["trainer"]["max_global_timesteps_M"]
     num_eval_envs = agent_cfg["trainer"]["num_eval_envs"]
+    video_upload_interval = agent_cfg["experiment"].get("video_upload_interval", 1)
+    
     trainer = Trainer(
         env=env,
         agents=agent,
@@ -119,6 +129,7 @@ def make_trainer(env, agent, agent_cfg, auxiliary_task=None, writer=None):
         num_eval_envs=num_eval_envs,
         auxiliary_task=auxiliary_task,
         writer=writer,
+        video_upload_interval=video_upload_interval,
     )
     return trainer
 

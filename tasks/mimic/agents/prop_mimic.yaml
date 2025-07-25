@@ -80,9 +80,9 @@ experiment:
   directory: "simon-gormuzov-waseda-university"
   experiment_name: "prop_mimic"
   save_checkpoints: 1
-  upload_videos: 0 #1 for videos
-  video_upload_interval: 1  # Upload videos to wandb every N evaluation episodes (set to 0 to only upload during checkpoints)
-  video_length: 1000  # Length of videos in timesteps
+  upload_videos: 1 #1 for videos
+  video_upload_interval: 4  # Upload videos to wandb every N evaluation episodes (set to 0 to only upload during checkpoints)
+  video_length: 400  # Length of videos in timesteps
   debug: 0
   tb_log: True
   wandb: 1
