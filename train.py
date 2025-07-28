@@ -46,8 +46,10 @@ parser.add_argument(
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+# Automatically enable cameras when video recording is requested
 if args_cli.video:
     args_cli.enable_cameras = True
+    print("[INFO] Automatically enabling cameras for video recording")
 sys.argv = [sys.argv[0]] + hydra_args
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -79,7 +81,7 @@ def main(env_cfg, agent_cfg: dict):
     agent_cfg["seed"] = args_cli.seed if args_cli.seed is not None else agent_cfg["seed"]
     set_seed(agent_cfg["seed"])
     agent_cfg["log_path"] = LOG_PATH
-    args_cli.video = agent_cfg["experiment"]["upload_videos"]
+    args_cli.video = args_cli.video or agent_cfg["experiment"].get("upload_videos", False)
 
     # Override video_length from agent config if available
     if "experiment" in agent_cfg and "video_length" in agent_cfg["experiment"]:
@@ -94,6 +96,9 @@ def main(env_cfg, agent_cfg: dict):
 
     # LOGGING SETUP
     writer = Writer(agent_cfg)
+    print(f"[DEBUG] Writer created. Wandb enabled: {agent_cfg['experiment'].get('wandb', False)}")
+    if hasattr(writer, 'wandb_session'):
+        print(f"[DEBUG] Writer wandb_session: {writer.wandb_session is not None}")
 
     # Make environment. Order must be gymnasium Env -> FrameStack -> IsaacLab
     env = make_env(env_cfg, writer, args_cli, agent_cfg["models"]["obs_stack"])

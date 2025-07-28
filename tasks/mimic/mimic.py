@@ -24,7 +24,7 @@ from isaaclab.envs import VecEnvObs
 from isaaclab.envs.common import VecEnvStepReturn
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.markers.config import RED_ARROW_X_MARKER_CFG
-from isaaclab.sensors import Camera, CameraCfg
+# Camera imports removed - using viewport capture instead
 from isaaclab.sim.schemas.schemas_cfg import (
     ArticulationRootPropertiesCfg,
     CollisionPropertiesCfg,
@@ -34,7 +34,7 @@ from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
 from isaaclab.sim.spawners.materials import PreviewSurfaceCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.configclass import MISSING
-from isaaclab.utils.math import sample_uniform, quat_from_euler_xyz, quat_apply_inverse
+from isaaclab.utils.math import sample_uniform, quat_apply_inverse
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 # =============================================================================
@@ -106,10 +106,10 @@ class ExternalDisturbanceCfg:
     target_body_name: str = "right_arm_link_5"
 
     # Force parameters (in Newtons, applied in global/world coordinate frame)
-    force_magnitude_range: tuple[float, float] = (300.0, 850.0)
+    force_magnitude_range: tuple[float, float] = (30.0, 150.0)
 
     # Duration parameters (in seconds)
-    duration_range: tuple[float, float] = (0.5, 2.5)  # Shorter duration for more frequent changes
+    duration_range: tuple[float, float] = (0.5, 1.5)  # Shorter duration for more frequent changes
 
     # Interval between disturbances (in seconds)
     interval_range: tuple[float, float] = (0.5, 3.0)  # Shorter cooldown
@@ -124,7 +124,7 @@ class ExternalDisturbanceCfg:
     # Directional bias parameters (for simulating leaning)
     # Bias values are normalized direction weights (will be normalized to unit vector)
     directional_bias: tuple[float, float, float] = (0.0, 0.0, -1.0)  # Default: downward bias
-    bias_strength: float = 0.4  # 0.0 = pure random, 1.0 = pure bias direction
+    bias_strength: float = 0.6  # 0.0 = pure random, 1.0 = pure bias direction
 
     # Visualization parameters
     enable_force_visualization: bool = True
@@ -138,12 +138,11 @@ class ExternalDisturbanceCfg:
 
 
 # -- Ghost Robot Configuration
-# Defines the USD asset and initial state for the ghost robot used for visualization.
-KINEMATIC_GHOST_USD_FILE_PATH = "assets/airec/airec_ghost.usd"
+# Use the main robot USD for ghost robot to ensure compatibility in headless mode
 DEFAULT_KINEMATIC_GHOST_CFG = ArticulationCfg(
     prim_path="/World/envs/env_.*/GhostKinematicRobot",
     spawn=UsdFileCfg(
-        usd_path=KINEMATIC_GHOST_USD_FILE_PATH,
+        usd_path="/home/simon/IsaacLab/scripts/AIREC_Packages/isaaclab_rl/isaaclab_rl_project_mimic/assets/airec/dry-airec.usd",
     ),
     init_state=ArticulationCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0)),
     actuators={},
@@ -220,22 +219,6 @@ class MimicEnvCfg(AIRECEnvCfg):
             visual_material=PreviewSurfaceCfg(diffuse_color=(0.8, 0.3, 0.3), roughness=0.4, metallic=0.1),  # Red color
         )
     )
-    
-    # -- Camera Configuration for headless visualization
-    camera_cfg: CameraCfg = CameraCfg(
-        prim_path="/World/envs/env_.*/Camera",
-        update_period=0.1,  # Update at 10 Hz
-        height=480,
-        width=640,
-        data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=24.0,
-            focus_distance=400.0,
-            horizontal_aperture=20.955,
-            clipping_range=(0.1, 10000.0),
-        ),
-        offset=CameraCfg.OffsetCfg(pos=(2.5, 2.5, 2.5), rot=(0.7071, 0.0, 0.7071, 0.0)),  # Isometric view
-    )
 
 
 # =============================================================================
@@ -268,6 +251,7 @@ class MimicEnv(AIRECEnv):
         # Initialize the Motion Mimicry Environment
         self.cfg = cfg
         self.ghost_robot = None
+        self.render_mode = render_mode
         self.ghost_mimic_joint_indices = None
 
         # -- Pre-initialization checks and setup
@@ -384,6 +368,16 @@ class MimicEnv(AIRECEnv):
         # Load animation data into a tensor for runtime access
         self._load_animation_data()
         # print(f"DEBUG: Animation loaded - steps: {self.max_animation_steps}, data exists: {hasattr(self, 'animation_pos_data')}")
+        
+        # Create weight vector for joint importance based on body part
+        self.joint_weights = torch.zeros(self.num_mimic_joints, device=self.device)
+        for i, csv_name in enumerate(self.cfg.csv_column_joint_names):
+            if csv_name.startswith('H'):  # Head joints (H1, H2, H3)
+                self.joint_weights[i] = self.cfg.rewards.head_joint_weight
+            elif csv_name.startswith('T'):  # Torso joints (T1, T2, T3)
+                self.joint_weights[i] = self.cfg.rewards.torso_joint_weight
+            else:  # Arm joints (R1-R7, L1-L7)
+                self.joint_weights[i] = self.cfg.rewards.arm_joint_weight
 
         # Animation can loop or continue beyond its original length - no length check needed
 
@@ -584,20 +578,35 @@ class MimicEnv(AIRECEnv):
         # Call parent setup to spawn the main robot and other base assets
         super()._setup_scene()
         # Parent scene setup complete
+        
+        # Add a single camera for video recording in GUI mode only
+        if self.render_mode == "rgb_array" and self.sim.has_gui():
+            self._setup_video_camera()
+        
 
-        # Spawn the ghost robot if enabled in the configuration and GUI is available (or force enabled in headless)
-        # Automatically disable ghost robot in headless mode to save memory unless force enabled
-        if self.cfg.enable_ghost_visualizer and self.sim.has_gui():
-            self.ghost_robot = Articulation(self.cfg.ghost_robot_cfg)
+        # Spawn the ghost robot if enabled in the configuration
+        if self.cfg.enable_ghost_visualizer:
+            # Create appropriate config based on mode
+            if self.sim.has_gui():
+                # GUI mode - use the config with visual materials
+                self.ghost_robot = Articulation(self.cfg.ghost_robot_cfg)
+                print("[INFO] Ghost visualizer robot added with visual materials.")
+                # Hide base-related visuals for the ghost robot
+                self._hide_ghost_base_visuals()
+            else:
+                # Headless mode - create config without visual materials
+                headless_ghost_cfg = self.cfg.ghost_robot_cfg.replace(
+                    spawn=self.cfg.ghost_robot_cfg.spawn.replace(
+                        visual_material=None  # Remove visual material in headless mode
+                    )
+                )
+                self.ghost_robot = Articulation(headless_ghost_cfg)
+                print("[INFO] Ghost robot added in headless mode (no visual materials).")
+            
             self.scene.articulations["ghost_robot"] = self.ghost_robot
-            print("[INFO] Ghost visualizer robot added to the scene.")
-
-            # Hide base-related visuals for the ghost robot
-            self._hide_ghost_base_visuals()
         else:
-            print("[INFO] Ghost visualizer disabled in headless mode for performance.")
-            # Disable ghost robot to save memory
-            self.cfg.enable_ghost_visualizer = False
+            print("[INFO] Ghost visualizer disabled.")
+            self.ghost_robot = None
 
         # Initialize force visualization markers if enabled and GUI is available
         if (
@@ -844,6 +853,7 @@ class MimicEnv(AIRECEnv):
                 ghost_link_ori=ghost_link_ori,
                 joint_pos_lower=self.mimic_joint_pos_lower,
                 joint_pos_upper=self.mimic_joint_pos_upper,
+                joint_weights=self.joint_weights,
             )
         )
 
@@ -1373,6 +1383,69 @@ class MimicEnv(AIRECEnv):
 
         return terminated, truncated
 
+    def _setup_video_camera(self):
+        """Set up viewport capture for video recording in GUI mode."""
+        # No camera setup needed - we'll capture the viewport directly
+        self.video_camera = None
+        print(f"[MimicEnv] Video recording will use viewport capture")
+    
+    def render(self):
+        """Render the environment - capture viewport in GUI mode."""
+        if hasattr(self, 'render_mode') and self.render_mode == 'rgb_array':
+            # Only works in GUI mode
+            if not self.sim.has_gui():
+                return None
+                
+            try:
+                # Try to capture viewport using omni.kit.viewport
+                import omni.kit.viewport.utility as viewport_utils
+                import numpy as np
+                
+                # Get the default viewport
+                viewport_api = viewport_utils.get_active_viewport()
+                if viewport_api:
+                    # Capture the viewport frame
+                    capture = viewport_api.get_frame_as_texture()
+                    if capture:
+                        # Convert to numpy array
+                        frame = np.frombuffer(capture, dtype=np.uint8)
+                        # Reshape based on viewport size
+                        height = viewport_api.get_height()
+                        width = viewport_api.get_width()
+                        if len(frame) == height * width * 4:  # RGBA
+                            frame = frame.reshape((height, width, 4))
+                            # Convert RGBA to RGB
+                            frame = frame[:, :, :3]
+                            return frame
+                        elif len(frame) == height * width * 3:  # RGB
+                            frame = frame.reshape((height, width, 3))
+                            return frame
+                
+                return None
+                
+            except Exception:
+                # Fallback: try synthetic data writer approach
+                try:
+                    import omni.replicator.core as rep
+                    
+                    # Create a render product for the viewport
+                    render_product = rep.create.render_product("/OmniverseKit_Persp", (1280, 720))
+                    
+                    # Capture frame
+                    rgb = rep.AnnotatorRegistry.get_annotator("rgb")
+                    rgb.attach(render_product)
+                    
+                    # Get the data
+                    data = rgb.get_data()
+                    if data is not None:
+                        return data
+                except:
+                    pass
+                    
+                return None
+        else:
+            return None
+
 
 # =============================================================================
 # Reward Function
@@ -1394,6 +1467,7 @@ def compute_mimic_rewards_simplified(
     ghost_link_ori: torch.Tensor | None = None,
     joint_pos_lower: torch.Tensor | None = None,
     joint_pos_upper: torch.Tensor | None = None,
+    joint_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Calculates the different components of the mimicry reward.
@@ -1413,6 +1487,7 @@ def compute_mimic_rewards_simplified(
         ghost_link_ori: Orientations of tracked links on ghost robot (num_envs, num_links, 4).
         joint_pos_lower: Lower limits for joint positions (num_joints,).
         joint_pos_upper: Upper limits for joint positions (num_joints,).
+        joint_weights: Importance weights for each joint (num_joints,).
 
     Returns:
         A tuple containing the total reward and its individual components:
@@ -1452,13 +1527,11 @@ def compute_mimic_rewards_simplified(
             pos_error = target_positions - current_positions
         
         # Position tracking reward based on squared error (exponentially shaped)
-        if rewards_cfg.use_weighted_pos_tracking:
-            # Apply joint-specific weights (assuming standard joint order: head, torso, arms)
-            # This is a simplified weighting - would need proper joint mapping for full implementation
-            weights = torch.ones(num_tracked_joints, device=device)
-            # For now, apply uniform weighting since joint mapping is complex
+        if rewards_cfg.use_weighted_pos_tracking and joint_weights is not None:
+            # Apply joint-specific weights to squared errors
             pos_error_sq = torch.square(pos_error)
-            pos_error_sq_sum = torch.sum(pos_error_sq, dim=-1)
+            weighted_pos_error_sq = pos_error_sq * joint_weights.unsqueeze(0)
+            pos_error_sq_sum = torch.sum(weighted_pos_error_sq, dim=-1)
         else:
             pos_error_sq_sum = torch.sum(torch.square(pos_error), dim=-1)
             
@@ -1470,6 +1543,12 @@ def compute_mimic_rewards_simplified(
             # For raw radians, use the original variance
             pos_variance_term = rewards_cfg.pos_error_variance_scale * float(num_tracked_joints)
         pos_variance_term = max(pos_variance_term, 1e-6)  # avoid division by zero
+        
+        # Adjust variance if using weights to account for different scale
+        if rewards_cfg.use_weighted_pos_tracking and joint_weights is not None:
+            # Average weight to maintain similar variance scale
+            avg_weight = torch.mean(joint_weights).item()
+            pos_variance_term = pos_variance_term * avg_weight
         
         # Calculate base exponential reward
         base_reward = torch.exp(-pos_error_sq_sum / pos_variance_term)

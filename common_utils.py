@@ -51,8 +51,10 @@ def make_env(env_cfg, writer, args_cli, obs_stack=1):
         env = VideoRecorder(
             env=env,
             video_folder=writer.video_dir,
-            step_trigger=lambda step: step % args_cli.video_interval == 0,
-            video_length=args_cli.video_length,
+            # Record steps 100-400 of each episode (300 steps total)
+            episode_start_step=100,
+            episode_end_step=400,
+            video_length=300,  # Not used with episode range, but kept for compatibility
             name_prefix="isaac_lab_mimic",
             video_fps=30,
             eval_env_indices=eval_env_indices,
@@ -68,6 +70,28 @@ def make_env(env_cfg, writer, args_cli, obs_stack=1):
 
     # Isaac Lab wrapper
     env = IsaacLabWrapper(env, env_cfg.num_eval_envs, debug=env_cfg.debug)
+    
+    # Pass writer reference through to the VideoRecorder if it exists in the wrapper chain
+    if args_cli.video and writer is not None and env_cfg.num_eval_envs > 0:
+        # Find and attach writer to VideoRecorder through the wrapper chain
+        current_env = env
+        while hasattr(current_env, '_env'):
+            current_env = current_env._env
+            if isinstance(current_env, VideoRecorder):
+                current_env.writer = writer
+                print(f"[INFO] Writer attached to VideoRecorder for wandb uploads")
+                break
+        else:
+            # Also check 'env' attribute (some wrappers use this instead of '_env')
+            current_env = env
+            while hasattr(current_env, 'env'):
+                current_env = current_env.env
+                if isinstance(current_env, VideoRecorder):
+                    current_env.writer = writer
+                    print(f"[INFO] Writer attached to VideoRecorder for wandb uploads")
+                    break
+    
+    
     return env
 
 
