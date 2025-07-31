@@ -15,7 +15,7 @@ import torch
 
 # AIREC specific imports
 from assets.airec import AIREC_CFG
-from tasks.mimic.airec import AIRECEnv, AIRECEnvCfg, scale
+from tasks.mimic.airec import AIRECEnv, AIRECEnvCfg, scale, unscale
 
 # Isaac Lab imports
 import isaaclab.sim as sim_utils
@@ -50,7 +50,7 @@ class RewardsCfg:
     joint_pos_tracking_reward_scale: float = 3.0  # Reduced from 4.0
     pos_error_variance_scale: float = 0.25
     use_weighted_pos_tracking: bool = True
-    pos_tracking_power_scale: float = 2.0  # Power scaling to emphasize accuracy (>1 for super-linear)
+    pos_tracking_power_scale: float = 3.0  # Power scaling to emphasize accuracy (>1 for super-linear)
     normalize_joint_errors: bool = True  # Normalize joint errors to [-1, 1] range based on joint limits
     # Joint importance weights for different body parts
     head_joint_weight: float = 0.5
@@ -58,7 +58,7 @@ class RewardsCfg:
     arm_joint_weight: float = 1.0
 
     # Velocity tracking rewards
-    joint_vel_tracking_reward_scale: float = 2.0
+    joint_vel_tracking_reward_scale: float = 3.0
     vel_error_variance_scale: float = 0.5
 
     # Orientation rewards
@@ -337,7 +337,8 @@ class MimicEnv(AIRECEnv):
         # Override parent config with mimic-specific dimensions and settings
         modified_parent_cfg.actuated_joint_names = self.robot_mimicked_joint_names_ordered
         modified_parent_cfg.num_actions = self.num_mimic_joints
-        modified_parent_cfg.num_gt_observations = self.num_mimic_joints * 3
+        # GT observations: target positions (20) + ghost left link5 pose (7) + ghost right link5 pose (7) = 34
+        modified_parent_cfg.num_gt_observations = self.num_mimic_joints + 14
         if "prop" in modified_parent_cfg.obs_list:
             cfg_num_prop_joints = cfg.num_prop_joints
             modified_parent_cfg.num_prop_observations = cfg_num_prop_joints * 2 + 7 * 2 + self.num_mimic_joints
@@ -795,19 +796,64 @@ class MimicEnv(AIRECEnv):
             raise ValueError(f"Unsupported control_mode: '{self.cfg.control_mode}'.")
 
     def _get_gt(self) -> torch.Tensor:
-        """Constructs the ground-truth observation for the mimicry task."""
-        # Get current state of the mimicked joints
+        """Constructs the ground-truth observation for the mimicry task.
+        
+        Returns:
+            Tensor of shape (num_envs, 34) containing:
+            - Target animation joint positions (20) - normalized to [-1, 1]
+            - Ghost robot left arm link 5 pose - position (3) normalized + quaternion (4)
+            - Ghost robot right arm link 5 pose - position (3) normalized + quaternion (4)
+        """
+        # Get current state of the mimicked joints (only for getting shape)
         current_mimic_joints_pos = self.robot.data.joint_pos[:, self.mimic_joint_indices_in_robot]
-        current_mimic_joints_vel = self.robot.data.joint_vel[:, self.mimic_joint_indices_in_robot]
 
         # Get the target pose from the animation data for the current animation step
         target_animation_joint_pos = torch.zeros_like(current_mimic_joints_pos)
         if self.max_animation_steps > 0:
             safe_anim_indices = torch.clamp(self.current_animation_step, 0, self.max_animation_steps - 1)
             target_animation_joint_pos = self.animation_pos_data[safe_anim_indices, :]
+        
+        # Normalize target animation positions to [-1, 1] using joint limits
+        normalized_target_pos = unscale(
+            target_animation_joint_pos,
+            self.robot.data.soft_joint_pos_limits[0, self.mimic_joint_indices_in_robot, 0],
+            self.robot.data.soft_joint_pos_limits[0, self.mimic_joint_indices_in_robot, 1]
+        )
 
-        # Concatenate into the final ground-truth observation tensor: (current_pos, current_vel, target_pos)
-        return torch.cat((current_mimic_joints_pos, current_mimic_joints_vel, target_animation_joint_pos), dim=-1)
+        # Get normalized ghost robot arm link 5 poses
+        ghost_left_link5_pos = torch.zeros((self.num_envs, 3), device=self.device)
+        ghost_left_link5_rot = torch.zeros((self.num_envs, 4), device=self.device)
+        ghost_right_link5_pos = torch.zeros((self.num_envs, 3), device=self.device)
+        ghost_right_link5_rot = torch.zeros((self.num_envs, 4), device=self.device)
+        
+        # Define workspace bounds for arm link 5 positions (in meters)
+        # These are reasonable bounds for a humanoid robot's arm reach
+        workspace_lower = torch.tensor([-1.5, -1.5, -0.5], device=self.device)
+        workspace_upper = torch.tensor([1.5, 1.5, 2.5], device=self.device)
+        
+        if hasattr(self, 'tracking_link_ids') and self.tracking_link_ids is not None and self.ghost_robot is not None:
+            # Get ghost robot link states (already computed for reward)
+            ghost_body_states = self.ghost_robot.data.body_state_w[:, self.tracking_link_ids, :]
+            # Assuming order is [right_arm_link_5, left_arm_link_5] based on default config
+            if len(self.tracking_link_ids) >= 2:
+                # Extract positions and rotations
+                ghost_right_link5_pos = ghost_body_states[:, 0, :3]  # First link (right)
+                ghost_right_link5_rot = ghost_body_states[:, 0, 3:7]  # Quaternion
+                ghost_left_link5_pos = ghost_body_states[:, 1, :3]   # Second link (left)
+                ghost_left_link5_rot = ghost_body_states[:, 1, 3:7]  # Quaternion
+                
+                # Normalize positions to [-1, 1] using workspace bounds
+                ghost_left_link5_pos = unscale(ghost_left_link5_pos, workspace_lower, workspace_upper)
+                ghost_right_link5_pos = unscale(ghost_right_link5_pos, workspace_lower, workspace_upper)
+
+        # Concatenate: normalized target animation positions + normalized ghost link5 poses
+        return torch.cat((
+            normalized_target_pos,           # 20D (normalized)
+            ghost_left_link5_pos,            # 3D (normalized)
+            ghost_left_link5_rot,            # 4D (quaternion)
+            ghost_right_link5_pos,           # 3D (normalized)
+            ghost_right_link5_rot            # 4D (quaternion)
+        ), dim=-1)  # Total: 34D
 
     def _get_rewards(self) -> torch.Tensor:
         """Calculates rewards based on the robot's mimicry performance."""

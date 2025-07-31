@@ -10,8 +10,8 @@ This document provides a comprehensive description of the data flow in and out o
 The policy network receives two main observation types concatenated together:
 
 #### **Proprioceptive Observations (`prop`)**
-- **Source**: Robot's joint states and end-effector poses
-- **Components** (total 54 dimensions):
+- **Source**: Robot's joint states and arm link 5 poses
+- **Components** (total 74 dimensions):
   1. **Normalized Joint Positions** (20 dims)
      - Source: `robot.data.joint_pos` for first 20 joints
      - Normalization: `unscale()` function maps from joint limits to [-1, 1]
@@ -29,35 +29,37 @@ The policy network receives two main observation types concatenated together:
      - Range: Already in [-1, 1] (raw from policy)
      - No additional normalization
   
-  4. **Left Hand Pose** (7 dims)
+  4. **Left Arm Link 5 Pose** (7 dims)
      - Position (3): xyz in meters relative to base_link
      - Orientation (4): quaternion (w,x,y,z)
      - Source: `lhand_frame.data.target_pos_source` and `target_quat_source`
      - No normalization applied
+     - Note: Frame transformer now targets left_arm_link_5
   
-  5. **Right Hand Pose** (7 dims)
-     - Same format as left hand
+  5. **Right Arm Link 5 Pose** (7 dims)
+     - Same format as left arm link 5
      - Source: `rhand_frame.data.target_pos_source` and `target_quat_source`
+     - Note: Frame transformer now targets right_arm_link_5
 
 #### **Ground Truth Observations (`gt`)**
-- **Components** (total 60 dimensions):
-  1. **Current Mimic Joint Positions** (20 dims)
-     - Raw joint positions for the 20 controlled joints
-     - Source: `robot.data.joint_pos[:, mimic_joint_indices]`
-     - Units: radians
-     - No normalization
-  
-  2. **Current Mimic Joint Velocities** (20 dims)
-     - Raw joint velocities
-     - Source: `robot.data.joint_vel[:, mimic_joint_indices]`
-     - Units: rad/s
-     - No normalization
-  
-  3. **Target Animation Joint Positions** (20 dims)
+- **Components** (total 34 dimensions):
+  1. **Target Animation Joint Positions** (20 dims)
      - Target positions from CSV animation file
      - Source: `animation_pos_data[current_animation_step, :]`
      - Units: radians
      - Animation advances each environment step
+  
+  2. **Ghost Robot Left Arm Link 5 Pose** (7 dims)
+     - Position (3): xyz in meters (world coordinates)
+     - Orientation (4): quaternion (w,x,y,z)
+     - Source: `ghost_robot.data.body_state_w[:, tracking_link_ids[1], :]`
+     - Represents target pose from animation
+  
+  3. **Ghost Robot Right Arm Link 5 Pose** (7 dims)
+     - Position (3): xyz in meters (world coordinates)
+     - Orientation (4): quaternion (w,x,y,z)
+     - Source: `ghost_robot.data.body_state_w[:, tracking_link_ids[0], :]`
+     - Represents target pose from animation
 
 ### 1.2 Joint Mapping
 The 20 controlled joints are mapped as follows:
@@ -72,11 +74,11 @@ T1-T3 → torso_joint_1 through torso_joint_3
 ```
 
 ### 1.3 Complete Input Vector
-Total input size: **114 dimensions**
-- Proprioceptive: 54 dims
-- Ground Truth: 60 dims
+Total input size: **108 dimensions**
+- Proprioceptive: 74 dims
+- Ground Truth: 34 dims
 
-Example input tensor shape: `[num_envs, 114]`
+Example input tensor shape: `[num_envs, 108]`
 
 ## 2. Neural Network Architecture
 

@@ -133,7 +133,7 @@ class AIRECEnvCfg(DirectRLEnvCfg):
     observation_space = num_observations
     state_space = num_states
 
-    # -- Hand Frame Sensor Configuration
+    # -- Arm Link 5 Frame Sensor Configuration
     marker_cfg = FRAME_MARKER_CFG.copy()
     marker_cfg.markers["frame"].scale = (0.1, 0.1, 0.1)
     marker_cfg.prim_path = "/Visuals/EndEffectorFrameTransformer"
@@ -143,9 +143,9 @@ class AIRECEnvCfg(DirectRLEnvCfg):
         visualizer_cfg=marker_cfg,
         target_frames=[
             FrameTransformerCfg.FrameCfg(
-                prim_path="/World/envs/env_.*/Robot/left_hand_palm_link",
+                prim_path="/World/envs/env_.*/Robot/left_arm_link_5",
                 name="end_effector",
-                offset=OffsetCfg(pos=[0.0, 0.0, 0.02]),
+                offset=OffsetCfg(pos=[0.0, 0.0, 0.0]),
             )
         ],
     )
@@ -155,9 +155,9 @@ class AIRECEnvCfg(DirectRLEnvCfg):
         visualizer_cfg=marker_cfg,
         target_frames=[
             FrameTransformerCfg.FrameCfg(
-                prim_path="/World/envs/env_.*/Robot/right_hand_palm_link",
+                prim_path="/World/envs/env_.*/Robot/right_arm_link_5",
                 name="end_effector",
-                offset=OffsetCfg(pos=[0.0, 0.0, 0.02]),
+                offset=OffsetCfg(pos=[0.0, 0.0, 0.0]),
             )
         ],
     )
@@ -268,10 +268,11 @@ class AIRECEnv(DirectRLEnv):
         self.external_force_b = torch.zeros((self.num_envs, self.robot.num_bodies, 3), device=self.device)
         self.external_torque_b = torch.zeros((self.num_envs, self.robot.num_bodies, 3), device=self.device)
 
-        self.lhand_pos = torch.zeros((self.num_envs, 3), device=self.device)
-        self.lhand_rot = torch.zeros((self.num_envs, 4), device=self.device)
-        self.rhand_pos = torch.zeros((self.num_envs, 3), device=self.device)
-        self.rhand_rot = torch.zeros((self.num_envs, 4), device=self.device)
+        # Note: Variable names kept as lhand/rhand for compatibility, but now track arm link 5
+        self.lhand_pos = torch.zeros((self.num_envs, 3), device=self.device)  # left_arm_link_5 position
+        self.lhand_rot = torch.zeros((self.num_envs, 4), device=self.device)  # left_arm_link_5 rotation
+        self.rhand_pos = torch.zeros((self.num_envs, 3), device=self.device)  # right_arm_link_5 position
+        self.rhand_rot = torch.zeros((self.num_envs, 4), device=self.device)  # right_arm_link_5 rotation
 
         self._episode_timestep_counter = torch.zeros((self.num_envs,), dtype=torch.int16, device=self.device)
 
@@ -505,16 +506,25 @@ class AIRECEnv(DirectRLEnv):
         return {"policy": obs_dict}
 
     def _get_proprioception(self):
-        """Constructs the proprioceptive observation vector."""
+        """Constructs the proprioceptive observation vector.
+        
+        Returns:
+            Tensor of shape (num_envs, 74) containing:
+            - Normalized joint positions (20) - scaled to [-1, 1]
+            - Normalized joint velocities (20) - scaled to [-1, 1]
+            - Previous actions (20) - already in [-1, 1]
+            - Left arm link 5 position (3) normalized to [-1, 1] and rotation (4) quaternion
+            - Right arm link 5 position (3) normalized to [-1, 1] and rotation (4) quaternion
+        """
         prop = torch.cat(
             (
                 self.normalised_joint_pos,
                 self.normalised_joint_vel,
                 self.actions,  # Use actions instead of cur_targets/prev_targets for backward compatibility
-                self.lhand_pos,
-                self.lhand_rot,
-                self.rhand_pos,
-                self.rhand_rot,
+                self.lhand_pos,  # Now tracks left_arm_link_5
+                self.lhand_rot,  # Now tracks left_arm_link_5
+                self.rhand_pos,  # Now tracks right_arm_link_5
+                self.rhand_rot,  # Now tracks right_arm_link_5
             ),
             dim=-1,
         )
@@ -593,9 +603,21 @@ class AIRECEnv(DirectRLEnv):
             self.hard_vel_limits[self.prop_joint_indices]
         )
 
-        self.lhand_pos[_env_ids_to_use] = self.lhand_frame.data.target_pos_source[..., 0, :][_env_ids_to_use]
+        # Update arm link 5 poses (formerly hand poses) and normalize positions
+        # Define workspace bounds for arm link 5 positions (in meters)
+        workspace_lower = torch.tensor([-1.5, -1.5, -0.5], device=self.device)
+        workspace_upper = torch.tensor([1.5, 1.5, 2.5], device=self.device)
+        
+        # Get raw positions
+        raw_lhand_pos = self.lhand_frame.data.target_pos_source[..., 0, :][_env_ids_to_use]
+        raw_rhand_pos = self.rhand_frame.data.target_pos_source[..., 0, :][_env_ids_to_use]
+        
+        # Normalize positions to [-1, 1]
+        self.lhand_pos[_env_ids_to_use] = unscale(raw_lhand_pos, workspace_lower, workspace_upper)
+        self.rhand_pos[_env_ids_to_use] = unscale(raw_rhand_pos, workspace_lower, workspace_upper)
+        
+        # Rotations remain as quaternions (already unit normalized)
         self.lhand_rot[_env_ids_to_use] = self.lhand_frame.data.target_quat_source[..., 0, :][_env_ids_to_use]
-        self.rhand_pos[_env_ids_to_use] = self.rhand_frame.data.target_pos_source[..., 0, :][_env_ids_to_use]
         self.rhand_rot[_env_ids_to_use] = self.rhand_frame.data.target_quat_source[..., 0, :][_env_ids_to_use]
 
         # -- Mimic-specific logic (advancing animation, updating ghost)

@@ -35,16 +35,17 @@ The AIREC Mimic RL task is a reinforcement learning environment designed to trai
 
 The observation space includes three types of data:
 
-1. **Ground Truth (gt)**: 60 dimensions
-   - Current joint positions (20)
-   - Current joint velocities (20) 
+1. **Ground Truth (gt)**: 34 dimensions
    - Target joint positions from animation (20)
+   - Ghost robot left arm link 5 pose - position (3) + quaternion (4)
+   - Ghost robot right arm link 5 pose - position (3) + quaternion (4)
 
-2. **Proprioceptive (prop)**: Variable dimensions including:
-   - Normalized joint positions
-   - Joint velocities
-   - Previous actions
-   - End-effector poses (position + quaternion for each hand)
+2. **Proprioceptive (prop)**: 74 dimensions including:
+   - Normalized joint positions (20)
+   - Joint velocities (20)
+   - Previous actions (20)
+   - Left arm link 5 pose - position (3) + quaternion (4)
+   - Right arm link 5 pose - position (3) + quaternion (4)
 
 ### 4. Action Space
 - **Dimensions**: 20 (one per controlled joint)

@@ -10,6 +10,19 @@ or in Gazebo simulation. The policy expects:
 - Animation CSV data for target positions
 - Both proprioceptive and ground truth observations
 
+OBSERVATION SPACE (Total: 108 dimensions):
+- Proprioceptive (74D):
+  - Normalized joint positions (20) [-1, 1]
+  - Normalized joint velocities (20) [-1, 1]
+  - Previous actions (20) [-1, 1]
+  - Left arm link 5 pose: position (3) [-1, 1] + quaternion (4)
+  - Right arm link 5 pose: position (3) [-1, 1] + quaternion (4)
+  
+- Ground Truth (34D):
+  - Target animation positions (20) [-1, 1]
+  - Ghost left arm link 5: position (3) [-1, 1] + quaternion (4)
+  - Ghost right arm link 5: position (3) [-1, 1] + quaternion (4)
+
 Usage:
 1. Set checkpoint path:
    export MIMIC_CHECKPOINT_PATH=/path/to/your/checkpoint.pt
@@ -164,6 +177,13 @@ try:
         csv_idx = csv_columns.index(csv_col)
         animation_data[:, policy_idx] = csv_data[:, csv_idx]
     
+    # CRITICAL: Remove frame 0 which is all zeros
+    if np.all(animation_data[0] == 0):
+        rospy.logwarn("Frame 0 is all zeros, removing it from animation data")
+        animation_data = animation_data[1:]
+        max_animation_steps = len(animation_data)
+        current_animation_step = 0  # Now we can start from 0 since we removed the zero frame
+    
     # Convert to radians if needed
     if np.max(np.abs(animation_data)) > 10:
         print(f"[WARNING] Animation data appears to be in degrees, converting to radians")
@@ -287,40 +307,76 @@ def get_hand_transform(hand_link, base_link='/base_link'):
         # Return identity transform as fallback
         return np.zeros(3, dtype=np.float32), np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # (w,x,y,z) identity
 
+def compute_ghost_link_poses(target_joint_positions):
+    """Compute ghost robot arm link 5 poses from target joint positions.
+    
+    This is a placeholder that returns normalized zero positions.
+    In a full implementation, this would:
+    1. Use forward kinematics to compute link positions from joint angles
+    2. Normalize the positions using workspace bounds
+    
+    Args:
+        target_joint_positions: (20,) array of target joint positions in radians
+        
+    Returns:
+        left_pos: (3,) normalized position [-1, 1]
+        left_rot: (4,) quaternion (w,x,y,z)
+        right_pos: (3,) normalized position [-1, 1]
+        right_rot: (4,) quaternion (w,x,y,z)
+    """
+    # TODO: Implement forward kinematics
+    # For now, return normalized center positions (0,0,0) and identity rotations
+    left_pos = np.zeros(3, dtype=np.float32)
+    left_rot = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    right_pos = np.zeros(3, dtype=np.float32)
+    right_rot = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    
+    return left_pos, left_rot, right_pos, right_rot
+
 def get_proprioception(last_actions):
     """Construct proprioceptive observation for mimic policy.
     
     IMPORTANT: In simulation, this uses the last ACTIONS (normalized -1 to 1),
     not the current targets!
     """
-    # Get hand transforms
-    lhand_pos, lhand_rot = get_hand_transform('/left_hand/palm_link')
-    rhand_pos, rhand_rot = get_hand_transform('/right_hand/palm_link')
+    # Get arm link 5 transforms (instead of hand transforms)
+    larm_link5_pos, larm_link5_rot = get_hand_transform('/left_arm/link_5')
+    rarm_link5_pos, rarm_link5_rot = get_hand_transform('/right_arm/link_5')
     
-    # DEBUG: Check if hand positions are reasonable
-    if np.linalg.norm(lhand_pos) > 2.0 or np.linalg.norm(rhand_pos) > 2.0:
-        rospy.logwarn(f"Hand positions seem too far: L={lhand_pos}, R={rhand_pos}")
-    if abs(np.linalg.norm(lhand_rot) - 1.0) > 0.1 or abs(np.linalg.norm(rhand_rot) - 1.0) > 0.1:
-        rospy.logwarn(f"Hand quaternions not normalized: L_norm={np.linalg.norm(lhand_rot)}, R_norm={np.linalg.norm(rhand_rot)}")
+    # Normalize link 5 positions to [-1, 1] using workspace bounds
+    workspace_lower = np.array([-1.5, -1.5, -0.5])
+    workspace_upper = np.array([1.5, 1.5, 2.5])
+    
+    # Normalize using the same formula as simulation: (2.0 * x - upper - lower) / (upper - lower)
+    larm_link5_pos_norm = (2.0 * larm_link5_pos - workspace_upper - workspace_lower) / (workspace_upper - workspace_lower)
+    rarm_link5_pos_norm = (2.0 * rarm_link5_pos - workspace_upper - workspace_lower) / (workspace_upper - workspace_lower)
+    
+    # DEBUG: Check if normalized positions are in range
+    if np.any(np.abs(larm_link5_pos_norm) > 1.0) or np.any(np.abs(rarm_link5_pos_norm) > 1.0):
+        rospy.logwarn(f"Normalized arm link5 positions out of range: L={larm_link5_pos_norm}, R={rarm_link5_pos_norm}")
+    if abs(np.linalg.norm(larm_link5_rot) - 1.0) > 0.1 or abs(np.linalg.norm(rarm_link5_rot) - 1.0) > 0.1:
+        rospy.logwarn(f"Arm link5 quaternions not normalized: L_norm={np.linalg.norm(larm_link5_rot)}, R_norm={np.linalg.norm(rarm_link5_rot)}")
     
     prop = torch.cat((
         torch.tensor(latest_joint_pos_norm, dtype=torch.float32),
         torch.tensor(latest_joint_vel_norm, dtype=torch.float32),
         torch.tensor(last_actions, dtype=torch.float32),  # Use actions, not targets!
-        torch.tensor(lhand_pos, dtype=torch.float32),
-        torch.tensor(lhand_rot, dtype=torch.float32),
-        torch.tensor(rhand_pos, dtype=torch.float32),
-        torch.tensor(rhand_rot, dtype=torch.float32)
+        torch.tensor(larm_link5_pos_norm, dtype=torch.float32),  # Normalized positions
+        torch.tensor(larm_link5_rot, dtype=torch.float32),
+        torch.tensor(rarm_link5_pos_norm, dtype=torch.float32),  # Normalized positions
+        torch.tensor(rarm_link5_rot, dtype=torch.float32)
     ))
     return prop
 
 def get_gt():
-    """Construct ground truth observation with animation targets.
+    """Construct ground truth observation with animation targets and ghost link poses.
     
-    GT observation structure (60D total):
-    - indices 0-19: current joint positions (radians, NOT normalized)
-    - indices 20-39: current joint velocities (rad/s, NOT normalized) 
-    - indices 40-59: target animation positions (radians)
+    GT observation structure (34D total):
+    - indices 0-19: target animation positions (normalized to [-1, 1])
+    - indices 20-22: ghost left arm link5 position (normalized to [-1, 1])
+    - indices 23-26: ghost left arm link5 rotation (4D quaternion)
+    - indices 27-29: ghost right arm link5 position (normalized to [-1, 1])
+    - indices 30-33: ghost right arm link5 rotation (4D quaternion)
     
     This matches the training environment's _get_gt() method in mimic.py
     """
@@ -329,12 +385,19 @@ def get_gt():
     # Target positions from animation
     target_pos = animation_data[current_animation_step % max_animation_steps]
     
-    # IMPORTANT: GT observation uses raw values, not normalized!
-    # The training environment concatenates raw joint positions and velocities
+    # Normalize target positions to [-1, 1] using joint limits
+    # Using the same formula as simulation: (2.0 * x - upper - lower) / (upper - lower)
+    target_pos_norm = (2.0 * target_pos - UPPER_LIMITS - LOWER_LIMITS) / (UPPER_LIMITS - LOWER_LIMITS)
+    
+    # Get ghost arm link 5 transforms from target positions
+    ghost_left_pos, ghost_left_rot, ghost_right_pos, ghost_right_rot = compute_ghost_link_poses(target_pos)
+    
     gt = torch.cat((
-        torch.tensor(latest_joint_pos, dtype=torch.float32),           # 0-19: current positions (rad)
-        torch.tensor(latest_joint_vel, dtype=torch.float32),           # 20-39: current velocities (rad/s) - RAW VALUES!
-        torch.tensor(target_pos, dtype=torch.float32)                  # 40-59: animation targets (rad)
+        torch.tensor(target_pos_norm, dtype=torch.float32),      # 0-19: normalized animation targets
+        torch.tensor(ghost_left_pos, dtype=torch.float32),       # 20-22: normalized ghost left link5 pos
+        torch.tensor(ghost_left_rot, dtype=torch.float32),       # 23-26: ghost left link5 rot
+        torch.tensor(ghost_right_pos, dtype=torch.float32),      # 27-29: normalized ghost right link5 pos
+        torch.tensor(ghost_right_rot, dtype=torch.float32)       # 30-33: ghost right link5 rot
     ))
     return gt
 
@@ -347,8 +410,8 @@ def rl_policy_loop():
     global current_animation_step, tf_listener
     
     # Observation space dimensions
-    num_prop = 74  # 20 pos + 20 vel + 20 actions + 14 hand states
-    num_gt = 60    # 20 current pos + 20 current vel + 20 target pos
+    num_prop = 74  # 20 pos + 20 vel + 20 actions + 14 arm link5 states (7+7)
+    num_gt = 34    # 20 target pos + 14 ghost arm link5 states (7+7)
     num_actions = 20
     
     observation_space = {
@@ -388,11 +451,13 @@ def rl_policy_loop():
     
     # Load checkpoint
     # Note: For sim2real, ensure this checkpoint is from Isaac Lab mimic training
-    checkpoint_path = os.path.join(os.path.dirname(__file__), "/home/d-airec/catkin_ws/isaaclab_rl/deployment/best_agent.pt")
+    checkpoint_path = os.environ.get('MIMIC_CHECKPOINT_PATH', 
+                                   os.path.join(os.path.dirname(__file__), "best_agent.pt"))
     
     if not os.path.exists(checkpoint_path):
         rospy.logerr(f"Checkpoint not found at: {checkpoint_path}")
-        rospy.logerr("Please set MIMIC_CHECKPOINT_PATH environment variable")
+        rospy.logerr("Please provide checkpoint path via MIMIC_CHECKPOINT_PATH environment variable")
+        rospy.logerr("Example: export MIMIC_CHECKPOINT_PATH=/path/to/your/checkpoint.pt")
         return
     
     rospy.loginfo(f"Loading checkpoint from: {checkpoint_path}")
@@ -459,14 +524,14 @@ def rl_policy_loop():
             cur_targets = latest_joint_pos.copy()
             prev_targets = cur_targets.copy()
         else:
-            # Fallback to animation frame 1 if no joint data
-            initial_animation_targets = animation_data[1]  # Use frame 1 since frame 0 is zeros
+            # Fallback to animation frame 0 if no joint data
+            initial_animation_targets = animation_data[0]
             cur_targets = initial_animation_targets.copy()
             prev_targets = cur_targets.copy()
     
     # First, move robot to a reasonable starting pose (not T-pose)
-    # Use animation frame 1 which has arms at -90 degrees
-    initial_pose = animation_data[1].copy()
+    # Use animation frame 0 (which was frame 1 before we removed the zero frame)
+    initial_pose = animation_data[0].copy()
     rospy.loginfo("Moving to initial pose (arms down)...")
     rospy.loginfo(f"Initial pose targets: {initial_pose[:5]}... (first 5 joints)")
     rospy.loginfo(f"Initial pose - Left arm: {initial_pose[4]:.3f}, {initial_pose[7]:.3f}, {initial_pose[10]:.3f} rad")
@@ -495,7 +560,26 @@ def rl_policy_loop():
     last_actions = np.zeros(20, dtype=np.float32)
     
     # Debug mode: bypass policy and follow animation directly
-    BYPASS_POLICY = True  # Set to True to test animation following without policy
+    BYPASS_POLICY = False  # Set to True to test animation following without policy
+    
+    # Analyze animation data for arm joints
+    rospy.loginfo("\n=== ANIMATION DATA ANALYSIS ===")
+    for joint_idx in [4, 5, 7, 8]:  # arm joint 1s and 2s
+        joint_name = policy_joint_order[joint_idx]
+        anim_vals = animation_data[:, joint_idx]
+        rospy.loginfo(f"{joint_name}:")
+        rospy.loginfo(f"  Animation range: [{np.min(anim_vals):.3f}, {np.max(anim_vals):.3f}] rad")
+        rospy.loginfo(f"  Joint limits: [{LOWER_LIMITS[joint_idx]:.3f}, {UPPER_LIMITS[joint_idx]:.3f}] rad")
+        rospy.loginfo(f"  Animation mean: {np.mean(anim_vals):.3f} rad")
+        # Check first few frames
+        rospy.loginfo(f"  First 5 frames: {anim_vals[:5]}")
+        # Check if animation is within limits
+        below_limit = np.sum(anim_vals < LOWER_LIMITS[joint_idx])
+        above_limit = np.sum(anim_vals > UPPER_LIMITS[joint_idx])
+        if below_limit > 0:
+            rospy.logwarn(f"  {below_limit}/{len(anim_vals)} frames below lower limit!")
+        if above_limit > 0:
+            rospy.logwarn(f"  {above_limit}/{len(anim_vals)} frames above upper limit!")
     
     while not rospy.is_shutdown() and episode_steps < EPISODE_TIMESTEPS:
         with data_lock:
@@ -509,6 +593,32 @@ def rl_policy_loop():
                 "prop": get_proprioception(last_actions),
                 "gt": get_gt()
             }
+            
+            # First time verification
+            if first_init:
+                rospy.loginfo("\n=== Observation Space Verification ===")
+                rospy.loginfo(f"Proprioceptive observation shape: {obs['prop'].shape} (expected: 74)")
+                rospy.loginfo(f"Ground truth observation shape: {obs['gt'].shape} (expected: 34)")
+                rospy.loginfo(f"Total observation dimensions: {obs['prop'].shape[0] + obs['gt'].shape[0]} (expected: 108)")
+                
+                # Check normalization ranges
+                prop_np = obs['prop'].numpy()
+                gt_np = obs['gt'].numpy()
+                rospy.loginfo(f"\nNormalization check:")
+                rospy.loginfo(f"  Prop range: [{prop_np.min():.3f}, {prop_np.max():.3f}]")
+                rospy.loginfo(f"  GT range: [{gt_np.min():.3f}, {gt_np.max():.3f}]")
+                
+                # Check individual components
+                rospy.loginfo(f"\nProp components:")
+                rospy.loginfo(f"  Joint pos (0-19): [{prop_np[:20].min():.3f}, {prop_np[:20].max():.3f}]")
+                rospy.loginfo(f"  Joint vel (20-39): [{prop_np[20:40].min():.3f}, {prop_np[20:40].max():.3f}]")
+                rospy.loginfo(f"  Actions (40-59): [{prop_np[40:60].min():.3f}, {prop_np[40:60].max():.3f}]")
+                rospy.loginfo(f"  Link5 pos (60-65,67-69): [{prop_np[60:63].min():.3f}, {prop_np[60:63].max():.3f}]")
+                
+                rospy.loginfo(f"\nGT components:")
+                rospy.loginfo(f"  Target pos (0-19): [{gt_np[:20].min():.3f}, {gt_np[:20].max():.3f}]")
+                rospy.loginfo(f"  Ghost link5 pos: [{gt_np[20:23].min():.3f}, {gt_np[20:23].max():.3f}]")
+                first_init = False
         
         # Debug: Log observations before policy
         if episode_steps < 5:
@@ -524,20 +634,7 @@ def rl_policy_loop():
             rospy.loginfo(f"    - Animation targets (40-59): {obs['gt'][40:45].numpy()}...")
             rospy.loginfo(f"    - Animation targets mean: {obs['gt'][40:60].mean().item():.3f}")
         
-        # CRITICAL DEBUG: Log observations and outputs periodically
-        if episode_steps % 100 == 0 or episode_steps < 3:
-            prop_raw = obs["prop"].numpy()
-            gt_raw = obs["gt"].numpy()
-            rospy.loginfo(f"\n=== Step {episode_steps} DEBUG ===")
-            rospy.loginfo(f"Prop obs: min={prop_raw.min():.3f}, max={prop_raw.max():.3f}, mean={prop_raw.mean():.3f}")
-            rospy.loginfo(f"GT obs: min={gt_raw.min():.3f}, max={gt_raw.max():.3f}, mean={gt_raw.mean():.3f}")
-            # Key components
-            rospy.loginfo(f"  Joint pos norm (0-19): [{prop_raw[:20].min():.2f}, {prop_raw[:20].max():.2f}]")
-            rospy.loginfo(f"  Joint vel norm (20-39): [{prop_raw[20:40].min():.2f}, {prop_raw[20:40].max():.2f}]")
-            rospy.loginfo(f"  Actions (40-59): [{prop_raw[40:60].min():.2f}, {prop_raw[40:60].max():.2f}]")
-            rospy.loginfo(f"  Hand poses (60-73): [{prop_raw[60:].min():.2f}, {prop_raw[60:].max():.2f}]")
-            rospy.loginfo(f"  GT current vel (20-39): [{gt_raw[20:40].min():.2f}, {gt_raw[20:40].max():.2f}] rad/s")
-            rospy.loginfo(f"  GT target pos (40-59): [{gt_raw[40:60].min():.2f}, {gt_raw[40:60].max():.2f}] rad")
+        # Remove periodic debug logging to reduce clutter
         
         # Run policy
         z = encoder(obs)
@@ -549,21 +646,33 @@ def rl_policy_loop():
         if BYPASS_POLICY:
             # Bypass policy - create actions to track animation
             anim_targets = animation_data[current_animation_step % max_animation_steps]
+            
+            # Check if animation targets are within joint limits
+            if episode_steps % 100 == 0:
+                for i in [4, 5]:  # Check arm joint 1's
+                    if anim_targets[i] < LOWER_LIMITS[i] or anim_targets[i] > UPPER_LIMITS[i]:
+                        rospy.logwarn(f"Animation target for {policy_joint_order[i]} is outside limits: {anim_targets[i]:.3f} not in [{LOWER_LIMITS[i]:.3f}, {UPPER_LIMITS[i]:.3f}]")
+            
             # Simple P-controller: action proportional to error
             errors = anim_targets - latest_joint_pos
             # Need to normalize errors to action space [-1, 1]
             # First normalize errors by joint ranges
             normalized_errors = errors / (UPPER_LIMITS - LOWER_LIMITS)
-            # Then apply proportional gain
-            actions = np.clip(2.0 * normalized_errors, -1.0, 1.0)  # Higher gain for better tracking
+            # Then apply proportional gain - use higher gain for arms
+            gains = np.ones(20) * 3.0
+            gains[4] = 10.0  # Much higher gain for left arm joint 1
+            gains[5] = 10.0  # Much higher gain for right arm joint 1
+            gains[7] = 8.0   # Higher gain for left arm joint 2
+            gains[8] = 8.0   # Higher gain for right arm joint 2
+            actions = np.clip(gains * normalized_errors, -1.0, 1.0)
             
-            # Enhanced logging for bypass mode
-            max_error_idx = np.argmax(np.abs(errors))
-            rospy.loginfo(f"[BYPASS] Step {episode_steps}: max error {np.abs(errors).max():.3f} rad ({np.rad2deg(np.abs(errors).max()):.1f} deg) on {policy_joint_order[max_error_idx]}")
-            if episode_steps % 50 == 0:
-                rospy.loginfo(f"  Current pos: {latest_joint_pos[:5]}...")
-                rospy.loginfo(f"  Target pos:  {anim_targets[:5]}...")
-                rospy.loginfo(f"  Actions:     {actions[:5]}...")
+            # Enhanced logging for bypass mode - only log every 200 steps
+            if episode_steps % 200 == 0:
+                max_error_idx = np.argmax(np.abs(errors))
+                rospy.loginfo(f"[BYPASS] Step {episode_steps}: max error {np.abs(errors).max():.3f} rad ({np.rad2deg(np.abs(errors).max()):.1f} deg) on {policy_joint_order[max_error_idx]}")
+                rospy.loginfo(f"  Left arm J1: curr={latest_joint_pos[4]:.3f}, tgt={anim_targets[4]:.3f}, err={errors[4]:.3f}")
+                rospy.loginfo(f"  Right arm J1: curr={latest_joint_pos[5]:.3f}, tgt={anim_targets[5]:.3f}, err={errors[5]:.3f}")
+                rospy.loginfo(f"  Actions (L/R arms): {actions[4]:.3f}, {actions[5]:.3f}")
         else:
             # Normal policy execution
             actions, _, _ = policy.act(z, deterministic=True)
@@ -572,12 +681,7 @@ def rl_policy_loop():
         # Store actions for next observation
         last_actions = actions.copy()
         
-        # Log actions periodically
-        if episode_steps % 100 == 0 or episode_steps < 3:
-            rospy.loginfo(f"  Actions: min={actions.min():.3f}, max={actions.max():.3f}, mean={actions.mean():.3f}")
-            saturated = np.sum(np.abs(actions) > 0.9)
-            if saturated > 0:
-                rospy.loginfo(f"  WARNING: {saturated} actions saturated at ±0.9")
+        # Remove action logging to reduce clutter
         
         # Scale actions
         scaled_targets = scale(actions, LOWER_LIMITS, UPPER_LIMITS)
@@ -588,11 +692,7 @@ def rl_policy_loop():
         cur_targets = ACTION_TAU * scaled_targets + (1 - ACTION_TAU) * prev_targets
         cur_targets = np.clip(cur_targets, LOWER_LIMITS, UPPER_LIMITS)
         
-        # Debug smoothing effect
-        if first_policy_output or episode_steps < 5:
-            rospy.loginfo(f"\n[DEBUG] Step {episode_steps} - After smoothing (tau={ACTION_TAU}):")
-            for i in range(min(6, len(cur_targets))):
-                rospy.loginfo(f"  {policy_joint_order[i]}: {prev_targets[i]:.3f} -> {cur_targets[i]:.3f} rad (diff: {cur_targets[i]-prev_targets[i]:.4f})")
+        # Remove smoothing debug
         
         # Safety checks
         if np.any(np.isnan(cur_targets)):
@@ -612,15 +712,7 @@ def rl_policy_loop():
             targets_history.append(cur_targets.copy())
             animation_targets_history.append(animation_data[current_animation_step % max_animation_steps].copy())
         
-        # Debug: Compare target vs animation
-        if first_policy_output or episode_steps < 5:
-            rospy.loginfo(f"\n[DEBUG] Step {episode_steps} - Final targets vs Animation:")
-            target_pos = animation_data[current_animation_step % max_animation_steps]
-            for i in range(min(6, len(cur_targets))):
-                diff = cur_targets[i] - target_pos[i]
-                rospy.loginfo(f"  {policy_joint_order[i]}: target={cur_targets[i]:.3f}, anim={target_pos[i]:.3f}, diff={diff:.3f} rad ({np.rad2deg(diff):.1f} deg)")
-        
-        first_policy_output = False
+        # Remove final targets debug
         
         # Publish command
         publish_joint_trajectory(
@@ -633,13 +725,13 @@ def rl_policy_loop():
         # Advance animation
         current_animation_step += 1
         if current_animation_step >= max_animation_steps:
-            current_animation_step = 1  # Loop back to frame 1, not 0
+            current_animation_step = 0  # Loop back to frame 0
             rospy.loginfo("Animation looped")
         
-        # Progress logging
+        # Progress logging - reduce frequency
         episode_steps += 1
-        if episode_steps % 100 == 0:
-            rospy.loginfo(f"Progress: {episode_steps}/{EPISODE_TIMESTEPS} (animation frame: {current_animation_step})")
+        if episode_steps % 300 == 0:
+            rospy.loginfo(f"Progress: {episode_steps}/{EPISODE_TIMESTEPS}")
         
         rate.sleep()
     
