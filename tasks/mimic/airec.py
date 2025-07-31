@@ -174,7 +174,7 @@ class AIRECEnvCfg(DirectRLEnvCfg):
     img_dim = 84
 
     # -- Action smoothing
-    act_moving_average = 0.01
+    act_moving_average = 0.1
     vel_max_magnitude = 3.0  # Legacy parameter, kept for compatibility
 
 

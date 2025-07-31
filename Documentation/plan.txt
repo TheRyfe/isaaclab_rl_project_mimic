@@ -1,0 +1,14 @@
+The plan to fix the techincal debt in this repo.
+
+Fix the model observational space
+--remove arm position observation
+--add head position proprioception & remove the base
+--make sure even the ground truth is correctly normalized
+
+create input data logger to document input data stream
+
+create output data logger to document data output stream
+
+alter the run_RL script to make sure the input and output data is correctly
+
+Deploy using position control on the real robot. 
